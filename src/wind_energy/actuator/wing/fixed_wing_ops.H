@@ -13,6 +13,23 @@ using namespace amrex::literals;
 
 namespace kynema_sgf::actuator::ops {
 
+// Shared section inputs for standalone wings and drone-owned arms.
+inline void
+read_wing_section_inputs(FixedWingData& wdata, const utils::ActParser& pp)
+{
+    pp.get("num_points", wdata.num_pts);
+    pp.query_either("epsilon", wdata.eps_inp);
+    pp.query_either("epsilon_chord", wdata.epsilon_chord);
+    if (!pp.contains("pitch_timetable")) {
+        // Constant pitch is required without timetable
+        pp.get("pitch", wdata.pitch);
+    }
+    pp.get("airfoil_table", wdata.airfoil_file);
+    pp.query("airfoil_type", wdata.airfoil_type);
+    pp.queryarr("span_locs", wdata.span_locs);
+    pp.queryarr("chord", wdata.chord_inp);
+}
+
 template <>
 struct ReadInputsOp<FixedWing, ActSrcLine>
 {
@@ -20,19 +37,9 @@ struct ReadInputsOp<FixedWing, ActSrcLine>
     {
         auto& wdata = data.meta();
         auto& info = data.info();
-        pp.get("num_points", wdata.num_pts);
         pp.get("start", wdata.start);
         pp.get("end", wdata.end);
-        pp.query_either("epsilon", wdata.eps_inp);
-        pp.query_either("epsilon_chord", wdata.epsilon_chord);
-        if (!pp.contains("pitch_timetable")) {
-            // Constant pitch is required without timetable
-            pp.get("pitch", wdata.pitch);
-        }
-        pp.get("airfoil_table", wdata.airfoil_file);
-        pp.query("airfoil_type", wdata.airfoil_type);
-        pp.queryarr("span_locs", wdata.span_locs);
-        pp.queryarr("chord", wdata.chord_inp);
+        read_wing_section_inputs(wdata, pp);
         bool use_fllc = false;
         pp.query("fllc", use_fllc);
 

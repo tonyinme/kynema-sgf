@@ -672,7 +672,9 @@ The supported wing-section inputs are ``num_points`` (at least two),
 Airfoil loading, lift/drag calculations, endpoint quadrature and directional
 smoothing follow the fixed-wing model. There is no separate arm Cd input or
 box-style smoothing rule on the arms. Independent wing motion, pitch histories,
-FLLC and two-dimensional projection options are not part of this interface.
+FLLC and two-dimensional projection options are rejected by this interface.
+Section inputs share the fixed-wing parser, including its default
+``span_locs = 0 1`` and ``chord = 1 1``; specify the physical arm chord.
 
 One arm is generated for each existing rotor hub, including unequal arm
 lengths or explicit ``arm_angles_degrees``. Its default start is the exit

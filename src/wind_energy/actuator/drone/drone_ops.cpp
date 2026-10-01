@@ -39,7 +39,9 @@ void validate_distinct_angles(const std::string& label, const RealList& angles)
 void read_structure(Drone::DataType& data, const utils::ActParser& pp)
 {
     auto& m = data.meta();
-    if (!pp.contains("body_dimensions")) return;
+    if (!pp.contains("body_dimensions")) {
+        return;
+    }
     RealList size;
     amrex::Vector<int> count;
     vs::Vector center, angles;
@@ -53,19 +55,30 @@ void read_structure(Drone::DataType& data, const utils::ActParser& pp)
     pp.get("body_epsilon", epsilon);
     pp.query("body_epsilon_min", minimum);
     pp.query("body_nonlinear_limit", limit);
-    AMREX_ALWAYS_ASSERT(size.size() == 2 && count.size() == 2);
-    for (auto v : size) AMREX_ALWAYS_ASSERT(std::isfinite(v));
-    for (int d = 0; d < 3; ++d) {
-        AMREX_ALWAYS_ASSERT(
-            std::isfinite(center[d]) && std::isfinite(angles[d]));
+    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+        size.size() == 2 && count.size() == 2,
+        "body_dimensions and body_num_points each require two entries");
+    for (auto v : size) {
+        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+            std::isfinite(v) && v > 0,
+            "body_dimensions must be finite and positive");
     }
-    AMREX_ALWAYS_ASSERT(
-        size[0] > 0 && size[1] > 0 && count[0] > 0 && count[1] > 0);
-    AMREX_ALWAYS_ASSERT(
+    for (int d = 0; d < 3; ++d) {
+        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+            std::isfinite(center[d]) && std::isfinite(angles[d]),
+            "body_offset and body_orientation must be finite");
+    }
+    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+        count[0] > 0 && count[1] > 0, "body_num_points must be positive");
+    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
         std::isfinite(cd) && cd >= 0 && std::isfinite(minimum) &&
-        minimum >= 0 && std::isfinite(limit) && limit > 0);
+            minimum >= 0 && std::isfinite(limit) && limit > 0,
+        "body_cd and body_epsilon_min must be finite and nonnegative; "
+        "body_nonlinear_limit must be finite and positive");
     const auto rotation = drone::body_rotation(angles);
-    AMREX_ALWAYS_ASSERT(count[0] <= std::numeric_limits<int>::max() / count[1]);
+    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+        count[0] <= std::numeric_limits<int>::max() / count[1],
+        "body_num_points product exceeds the supported integer range");
     m.box_points = count[0] * count[1];
     m.box_drag_area = cd * size[0] * size[1] / m.box_points;
     if (epsilon == "momentum_thickness") {
@@ -73,11 +86,16 @@ void read_structure(Drone::DataType& data, const utils::ActParser& pp)
     } else {
         pp.get("body_epsilon", m.box_epsilon);
     }
-    AMREX_ALWAYS_ASSERT(std::isfinite(m.box_epsilon) && m.box_epsilon >= 0);
+    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+        std::isfinite(m.box_epsilon) && m.box_epsilon >= 0,
+        "body_epsilon must be finite and nonnegative");
     m.box_epsilon = std::max(
         {m.box_epsilon, minimum,
          1.001_rt * std::sqrt(m.box_drag_area / (2 * limit))});
-    AMREX_ALWAYS_ASSERT(std::isfinite(m.box_epsilon) && m.box_epsilon > 0);
+    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+        std::isfinite(m.box_epsilon) && m.box_epsilon > 0,
+        "Final body epsilon must be finite and positive; set body_epsilon_min "
+        "for zero-drag momentum_thickness mode");
     for (int i = 0; i < count[0]; ++i) {
         for (int j = 0; j < count[1]; ++j) {
             m.body_points.push_back(
@@ -90,7 +108,20 @@ void read_structure(Drone::DataType& data, const utils::ActParser& pp)
     }
     utils::ActParser arm(
         "Actuator.Drone.arm", "Actuator." + data.info().label + ".arm");
-    if (!arm.contains("airfoil_table")) return;
+    if (!arm.contains("airfoil_table")) {
+        return;
+    }
+    for (const auto* key :
+         {"motion_type", "velocity", "pitch_timetable", "fllc",
+          "disable_spanwise_gaussian", "normalize_spanwise",
+          "active_force_dirs", "prescribed_uinf"}) {
+        if (arm.contains(key)) {
+            input_error(
+                data.info().label,
+                std::string("arm.") + key +
+                    " is not supported for drone-owned arms");
+        }
+    }
     for (const auto& rotor : m.rotors) {
         auto wing = std::make_unique<FixedWing::DataType>(
             data.sim(), data.info().label + ".arm", data.info().id);
@@ -108,48 +139,64 @@ void read_structure(Drone::DataType& data, const utils::ActParser& pp)
         } else {
             const auto c = center & rotation;
             const auto h = end & rotation;
-            AMREX_ALWAYS_ASSERT(
+            AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
                 std::abs(c.z()) < constants::TIGHT_TOL &&
-                std::abs(h.z()) < constants::TIGHT_TOL);
-            AMREX_ALWAYS_ASSERT(
-                std::abs(c.x()) < size[0] / 2 && std::abs(c.y()) < size[1] / 2);
+                    std::abs(h.z()) < constants::TIGHT_TOL,
+                "Automatic arms require coplanar box and hub rays; supply "
+                "arm.start otherwise");
+            AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+                std::abs(c.x()) < size[0] / 2 && std::abs(c.y()) < size[1] / 2,
+                "Automatic arms require the drone origin inside the box; "
+                "supply arm.start otherwise");
             amrex::Real fraction = 1;
             for (int d = 0; d < 2; ++d) {
                 const auto edge = c[d] + std::copysign(size[d] / 2, h[d]);
                 if (h[d] != 0) fraction = std::min(fraction, edge / h[d]);
             }
-            AMREX_ALWAYS_ASSERT(fraction > 0 && fraction < 1);
+            AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+                fraction > 0 && fraction < 1,
+                "Arm end must lie outside the box");
             start = fraction * end;
         }
-        const auto span = (end - start).unit();
+        const auto length = vs::mag(end - start);
+        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+            std::isfinite(length) && length > 0,
+            "Arm endpoints must define a finite, nonzero span");
+        const auto span = (end - start) / length;
         const auto chord = (span ^ vs::Vector::khat()).unit();
-        AMREX_ALWAYS_ASSERT(vs::mag(end - start) > 0 && vs::mag(chord) > 0);
+        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+            vs::mag(chord) > 0, "Vertical reference arms are not supported");
         vs::Tensor frame;
         frame.cols(chord, span, chord ^ span);
         w.start = vs::Vector::zero();
-        w.end = {0, vs::mag(end - start), 0};
-        arm.get("num_points", w.num_pts);
-        arm.get("pitch", w.pitch);
-        arm.getarr("chord", w.chord_inp);
-        arm.queryarr("span_locs", w.span_locs);
-        arm.get("airfoil_table", w.airfoil_file);
-        arm.query("airfoil_type", w.airfoil_type);
-        arm.query_either("epsilon", w.eps_inp);
-        arm.query_either("epsilon_chord", w.epsilon_chord);
-        AMREX_ALWAYS_ASSERT(
-            w.num_pts >= 2 && w.chord_inp.size() == w.span_locs.size());
-        AMREX_ALWAYS_ASSERT(
+        w.end = {0, length, 0};
+        read_wing_section_inputs(w, arm);
+        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+            w.num_pts >= 2 && w.chord_inp.size() == w.span_locs.size(),
+            "arm.num_points must be at least two; chord and span_locs must "
+            "have matching lengths");
+        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
             w.span_locs.size() >= 2 && w.span_locs.front() == 0 &&
-            w.span_locs.back() == 1 && std::isfinite(w.pitch));
+                w.span_locs.back() == 1 && std::isfinite(w.pitch),
+            "arm.span_locs must cover [0,1]; arm.pitch must be finite");
         for (int i = 0; i < static_cast<int>(w.span_locs.size()); ++i) {
-            AMREX_ALWAYS_ASSERT(
-                std::isfinite(w.chord_inp[i]) && w.chord_inp[i] > 0);
-            if (i > 0) AMREX_ALWAYS_ASSERT(w.span_locs[i] > w.span_locs[i - 1]);
+            AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+                std::isfinite(w.chord_inp[i]) && w.chord_inp[i] > 0,
+                "arm.chord must be finite and positive");
+            if (i > 0) {
+                AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+                    w.span_locs[i] > w.span_locs[i - 1],
+                    "arm.span_locs must be strictly increasing");
+            }
         }
         InitDataOp<FixedWing, ActSrcLine>()(*wing);
         for (int i = 0; i < w.num_pts; ++i) {
-            for (auto e : wing->grid().epsilon[i])
-                AMREX_ALWAYS_ASSERT(std::isfinite(e) && e > 0);
+            for (auto e : wing->grid().epsilon[i]) {
+                AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+                    std::isfinite(e) && e > 0,
+                    "arm.epsilon or arm.epsilon_chord must give positive "
+                    "finite widths in all directions");
+            }
             m.body_points.push_back(start + (frame & wing->grid().pos[i]));
         }
         m.arm_frames.push_back(frame);
@@ -443,9 +490,10 @@ void UpdatePosOp<Drone, ActSrcDrone>::operator()(Drone::DataType& data)
     const auto& m = data.meta();
     const auto t = data.sim().time().current_time() +
                    0.5_rt * sector::timestep_width(data.sim());
+    const auto center = m.body_motion->position(t);
+    const auto rotation = m.body_motion->orientation(t);
     for (int i = 0; i < static_cast<int>(m.body_points.size()); ++i) {
-        grid.pos[i] = m.body_motion->position(t) +
-                      (m.body_motion->orientation(t) & m.body_points[i]);
+        grid.pos[i] = center + (rotation & m.body_points[i]);
         grid.vel_pos[offset + i] = grid.pos[i];
     }
 }
@@ -544,9 +592,6 @@ void ActSrcOp<Drone, ActSrcDrone>::initialize()
 
 void ActSrcOp<Drone, ActSrcDrone>::setup_op()
 {
-    // Positions already use the midpoint; prevent the line source averaging
-    // twice.
-    m_structure.setup_op();
     m_structure.setup_op();
     for (auto& rotor : m_data.meta().rotors) {
         rotor->source.setup_op();

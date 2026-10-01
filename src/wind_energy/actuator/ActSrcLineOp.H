@@ -11,6 +11,10 @@ using namespace amrex::literals;
 
 namespace kynema_sgf::actuator::ops {
 
+// Ordinary wings supply end-of-step positions; composite actuators may supply
+// midpoints.
+enum class LineSourcePosition { end_of_step, midpoint };
+
 template <typename ActTrait>
 class ActSrcOp<ActTrait, ActSrcLine>
 {
@@ -24,14 +28,18 @@ private:
     DeviceVecList m_epsilon;
     DeviceTensorList m_orientation;
 
+    LineSourcePosition m_position_time;
     bool m_init_old{false};
 
     void copy_to_device();
 
 public:
-    explicit ActSrcOp(typename ActTrait::DataType& data)
+    explicit ActSrcOp(
+        typename ActTrait::DataType& data,
+        LineSourcePosition position_time = LineSourcePosition::end_of_step)
         : m_data(data)
         , m_act_src(m_data.sim().repo().get_field("actuator_src_term"))
+        , m_position_time(position_time)
     {}
 
     void initialize();
@@ -59,7 +67,7 @@ void ActSrcOp<ActTrait, ActSrcLine>::copy_to_device()
     const auto& grid = m_data.grid();
 
     // Populate old positions before new positions are updated
-    if (m_init_old) {
+    if (m_init_old && m_position_time == LineSourcePosition::end_of_step) {
         amrex::Gpu::copy(
             amrex::Gpu::deviceToDevice, m_pos.begin(), m_pos.end(),
             m_pos_old.begin());
@@ -78,12 +86,12 @@ void ActSrcOp<ActTrait, ActSrcLine>::copy_to_device()
         amrex::Gpu::hostToDevice, grid.orientation.begin(),
         grid.orientation.end(), m_orientation.begin());
 
-    if (!m_init_old) {
+    if (!m_init_old && m_position_time == LineSourcePosition::end_of_step) {
         amrex::Gpu::copy(
             amrex::Gpu::hostToDevice, grid.pos.begin(), grid.pos.end(),
             m_pos_old.begin());
-        m_init_old = true;
     }
+    m_init_old = true;
 }
 
 template <typename ActTrait>
@@ -114,6 +122,7 @@ void ActSrcOp<ActTrait, ActSrcLine>::operator()(
     const auto* eps = m_epsilon.data();
     const auto* tmat = m_orientation.data();
 
+    const bool midpoint = m_position_time == LineSourcePosition::midpoint;
     const auto dcoord_flags = m_data.grid().dcoord_flags;
 
     amrex::ParallelFor(bx, [=] AMREX_GPU_DEVICE(int i, int j, int k) {
@@ -125,9 +134,11 @@ void ActSrcOp<ActTrait, ActSrcLine>::operator()(
 
         amrex::RealArray src_force = {0.0_rt};
         for (int ip = 0; ip < npts; ++ip) {
-            // Put force at n+1/2 location for Godunov
+            // Average endpoints only when the caller has not supplied a
+            // midpoint.
             constexpr amrex::Real wt = 0.5_rt;
-            const auto pos_ip = wt * pos[ip] + (1.0_rt - wt) * opos[ip];
+            const auto pos_ip =
+                midpoint ? pos[ip] : wt * pos[ip] + (1.0_rt - wt) * opos[ip];
             const auto dist = cc - pos_ip;
             // Convert to local (chord, span, thickness) coords
             const auto dist_local_3D = tmat[ip] & dist;

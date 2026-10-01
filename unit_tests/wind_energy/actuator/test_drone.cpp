@@ -941,34 +941,47 @@ TEST_F(
     act::ops::InitDataOp<act::Drone, act::ActSrcDrone>()(data);
     act::ops::ActSrcOp<act::Drone, act::ActSrcDrone> source(data);
     source.initialize();
+    act::ops::ActSrcOp<act::Drone, act::ActSrcLine> endpoint_source(data);
+    endpoint_source.initialize();
     auto& field = sim().repo().get_field("actuator_src_term");
     const auto& geom = sim().mesh().Geom(0);
     const auto dx = geom.CellSizeArray();
     const auto lo = geom.ProbLoArray();
-    for (int step = 0; step < 2; ++step) {
-        const Vector point{step * 0.03_rt, 0, 0};
-        data.grid().pos[0] = point;
-        data.grid().force[0] = {0, 0, -1};
-        field.setVal(0.0_rt);
-        source.setup_op();
-        for (amrex::MFIter mfi(field(0)); mfi.isValid(); ++mfi)
-            source(0, mfi, geom);
-        EXPECT_NEAR(field(0).sum(2) * dx[0] * dx[1] * dx[2], -1.0, 2e-6);
-        // Compare every cell to the current midpoint, not the previous
-        // midpoint.
-        for (amrex::MFIter mfi(field(0)); mfi.isValid(); ++mfi) {
-            const auto a = field(0).array(mfi);
-            amrex::ParallelFor(
-                mfi.validbox(), [=] AMREX_GPU_DEVICE(int i, int j, int k) {
-                    const Vector x{
-                        lo[0] + (i + 0.5_rt) * dx[0],
-                        lo[1] + (j + 0.5_rt) * dx[1],
-                        lo[2] + (k + 0.5_rt) * dx[2]};
-                    a(i, j, k, 2) += act::utils::gaussian3d(
-                        x - point, Vector{0.04_rt, 0.04_rt, 0.04_rt});
-                });
+    for (bool midpoint : {true, false}) {
+        for (int step = 0; step < 2; ++step) {
+            const Vector point{step * 0.03_rt, 0, 0};
+            data.grid().pos[0] = point;
+            data.grid().force[0] = {0, 0, -1};
+            field.setVal(0.0_rt);
+            if (midpoint)
+                source.setup_op();
+            else
+                endpoint_source.setup_op();
+            for (amrex::MFIter mfi(field(0)); mfi.isValid(); ++mfi) {
+                if (midpoint)
+                    source(0, mfi, geom);
+                else
+                    endpoint_source(0, mfi, geom);
+            }
+            EXPECT_NEAR(field(0).sum(2) * dx[0] * dx[1] * dx[2], -1.0, 2e-6);
+            // Default wings still average endpoints; drone positions are
+            // already midpoints.
+            const Vector expected_position = midpoint ? point : 0.5_rt * point;
+            for (amrex::MFIter mfi(field(0)); mfi.isValid(); ++mfi) {
+                const auto a = field(0).array(mfi);
+                amrex::ParallelFor(
+                    mfi.validbox(), [=] AMREX_GPU_DEVICE(int i, int j, int k) {
+                        const Vector x{
+                            lo[0] + (i + 0.5_rt) * dx[0],
+                            lo[1] + (j + 0.5_rt) * dx[1],
+                            lo[2] + (k + 0.5_rt) * dx[2]};
+                        a(i, j, k, 2) += act::utils::gaussian3d(
+                            x - expected_position,
+                            Vector{0.04_rt, 0.04_rt, 0.04_rt});
+                    });
+            }
+            EXPECT_LT(field(0).norm0(2), 1e-10);
         }
-        EXPECT_LT(field(0).norm0(2), 1e-10);
     }
     remove(m_airfoil_file.c_str());
 }

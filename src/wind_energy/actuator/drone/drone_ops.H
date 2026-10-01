@@ -72,7 +72,8 @@ template <>
 class ActSrcOp<Drone, ActSrcDrone>
 {
 public:
-    explicit ActSrcOp(Drone::DataType& data) : m_data(data), m_structure(data)
+    explicit ActSrcOp(Drone::DataType& data)
+        : m_data(data), m_structure(data, LineSourcePosition::midpoint)
     {}
     void initialize();
     void setup_op();
