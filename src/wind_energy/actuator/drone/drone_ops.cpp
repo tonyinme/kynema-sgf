@@ -5,6 +5,8 @@
 #include "src/utilities/io_utils.H"
 #include "src/utilities/ncutils/nc_interface.H"
 
+#include "src/wind_energy/actuator/wing/fixed_wing_ops.H"
+#include "src/utilities/trig_ops.H"
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -30,6 +32,128 @@ void validate_distinct_angles(const std::string& label, const RealList& angles)
                 input_error(label, "arm angles must be distinct");
             }
         }
+    }
+}
+
+// Store geometry in the drone frame; evaluate wings in their local axes.
+void read_structure(Drone::DataType& data, const utils::ActParser& pp)
+{
+    auto& m = data.meta();
+    if (!pp.contains("body_dimensions")) return;
+    RealList size;
+    amrex::Vector<int> count;
+    vs::Vector center, angles;
+    amrex::Real cd, minimum = 0, limit = 0.38_rt;
+    std::string epsilon;
+    pp.getarr("body_dimensions", size);
+    pp.getarr("body_num_points", count);
+    pp.query("body_offset", center);
+    pp.query("body_orientation", angles);
+    pp.get("body_cd", cd);
+    pp.get("body_epsilon", epsilon);
+    pp.query("body_epsilon_min", minimum);
+    pp.query("body_nonlinear_limit", limit);
+    AMREX_ALWAYS_ASSERT(size.size() == 2 && count.size() == 2);
+    for (auto v : size) AMREX_ALWAYS_ASSERT(std::isfinite(v));
+    for (int d = 0; d < 3; ++d) {
+        AMREX_ALWAYS_ASSERT(
+            std::isfinite(center[d]) && std::isfinite(angles[d]));
+    }
+    AMREX_ALWAYS_ASSERT(
+        size[0] > 0 && size[1] > 0 && count[0] > 0 && count[1] > 0);
+    AMREX_ALWAYS_ASSERT(
+        std::isfinite(cd) && cd >= 0 && std::isfinite(minimum) &&
+        minimum >= 0 && std::isfinite(limit) && limit > 0);
+    const auto rotation = drone::body_rotation(angles);
+    AMREX_ALWAYS_ASSERT(count[0] <= std::numeric_limits<int>::max() / count[1]);
+    m.box_points = count[0] * count[1];
+    m.box_drag_area = cd * size[0] * size[1] / m.box_points;
+    if (epsilon == "momentum_thickness") {
+        m.box_epsilon = std::sqrt(2 * m.box_drag_area / std::acos(-1.0_rt));
+    } else {
+        pp.get("body_epsilon", m.box_epsilon);
+    }
+    AMREX_ALWAYS_ASSERT(std::isfinite(m.box_epsilon) && m.box_epsilon >= 0);
+    m.box_epsilon = std::max(
+        {m.box_epsilon, minimum,
+         1.001_rt * std::sqrt(m.box_drag_area / (2 * limit))});
+    AMREX_ALWAYS_ASSERT(std::isfinite(m.box_epsilon) && m.box_epsilon > 0);
+    for (int i = 0; i < count[0]; ++i) {
+        for (int j = 0; j < count[1]; ++j) {
+            m.body_points.push_back(
+                center +
+                (rotation & vs::Vector{
+                                ((i + 0.5_rt) / count[0] - 0.5_rt) * size[0],
+                                ((j + 0.5_rt) / count[1] - 0.5_rt) * size[1],
+                                0}));
+        }
+    }
+    utils::ActParser arm(
+        "Actuator.Drone.arm", "Actuator." + data.info().label + ".arm");
+    if (!arm.contains("airfoil_table")) return;
+    for (const auto& rotor : m.rotors) {
+        auto wing = std::make_unique<FixedWing::DataType>(
+            data.sim(), data.info().label + ".arm", data.info().id);
+        auto& w = wing->meta();
+        auto start = vs::Vector::zero();
+        auto end = rotor->body_offset;
+        const auto phase = vs::zrot(m.arm_angles_degrees[m.arms.size()]);
+        if (arm.contains("end")) {
+            arm.get("end", end);
+            end = phase & end;
+        }
+        if (arm.contains("start")) {
+            arm.get("start", start);
+            start = phase & start;
+        } else {
+            const auto c = center & rotation;
+            const auto h = end & rotation;
+            AMREX_ALWAYS_ASSERT(
+                std::abs(c.z()) < constants::TIGHT_TOL &&
+                std::abs(h.z()) < constants::TIGHT_TOL);
+            AMREX_ALWAYS_ASSERT(
+                std::abs(c.x()) < size[0] / 2 && std::abs(c.y()) < size[1] / 2);
+            amrex::Real fraction = 1;
+            for (int d = 0; d < 2; ++d) {
+                const auto edge = c[d] + std::copysign(size[d] / 2, h[d]);
+                if (h[d] != 0) fraction = std::min(fraction, edge / h[d]);
+            }
+            AMREX_ALWAYS_ASSERT(fraction > 0 && fraction < 1);
+            start = fraction * end;
+        }
+        const auto span = (end - start).unit();
+        const auto chord = (span ^ vs::Vector::khat()).unit();
+        AMREX_ALWAYS_ASSERT(vs::mag(end - start) > 0 && vs::mag(chord) > 0);
+        vs::Tensor frame;
+        frame.cols(chord, span, chord ^ span);
+        w.start = vs::Vector::zero();
+        w.end = {0, vs::mag(end - start), 0};
+        arm.get("num_points", w.num_pts);
+        arm.get("pitch", w.pitch);
+        arm.getarr("chord", w.chord_inp);
+        arm.queryarr("span_locs", w.span_locs);
+        arm.get("airfoil_table", w.airfoil_file);
+        arm.query("airfoil_type", w.airfoil_type);
+        arm.query_either("epsilon", w.eps_inp);
+        arm.query_either("epsilon_chord", w.epsilon_chord);
+        AMREX_ALWAYS_ASSERT(
+            w.num_pts >= 2 && w.chord_inp.size() == w.span_locs.size());
+        AMREX_ALWAYS_ASSERT(
+            w.span_locs.size() >= 2 && w.span_locs.front() == 0 &&
+            w.span_locs.back() == 1 && std::isfinite(w.pitch));
+        for (int i = 0; i < static_cast<int>(w.span_locs.size()); ++i) {
+            AMREX_ALWAYS_ASSERT(
+                std::isfinite(w.chord_inp[i]) && w.chord_inp[i] > 0);
+            if (i > 0) AMREX_ALWAYS_ASSERT(w.span_locs[i] > w.span_locs[i - 1]);
+        }
+        InitDataOp<FixedWing, ActSrcLine>()(*wing);
+        for (int i = 0; i < w.num_pts; ++i) {
+            for (auto e : wing->grid().epsilon[i])
+                AMREX_ALWAYS_ASSERT(std::isfinite(e) && e > 0);
+            m.body_points.push_back(start + (frame & wing->grid().pos[i]));
+        }
+        m.arm_frames.push_back(frame);
+        m.arms.push_back(std::move(wing));
     }
 }
 
@@ -260,6 +384,8 @@ void ReadInputsOp<Drone, ActSrcDrone>::operator()(
         meta.rotors.emplace_back(std::move(rotor));
     }
 
+    read_structure(data, pp);
+
     // The composite search region is the union of its child-sector regions.
     amrex::GpuArray<amrex::Real, AMREX_SPACEDIM> lo;
     amrex::GpuArray<amrex::Real, AMREX_SPACEDIM> hi;
@@ -275,6 +401,9 @@ void ReadInputsOp<Drone, ActSrcDrone>::operator()(
         }
     }
     data.info().bound_box = amrex::RealBox(lo.data(), hi.data());
+    // Moving structural kernels may extend beyond rotor search regions.
+    if (!meta.body_points.empty())
+        data.info().bound_box = data.sim().mesh().Geom(0).ProbDomain();
 }
 
 void InitDataOp<Drone, ActSrcDrone>::operator()(Drone::DataType& data)
@@ -285,7 +414,18 @@ void InitDataOp<Drone, ActSrcDrone>::operator()(Drone::DataType& data)
         InitDataOp<ActuatorSector, ActSrcSector>()(rotor->data);
         total_points += static_cast<int>(rotor->data.grid().vel_pos.size());
     }
-    data.grid().resize(0, total_points);
+    const int n = meta.body_points.size();
+    data.grid().resize(n, total_points + n);
+    data.grid().epsilon.assign(
+        n, vs::Vector{meta.box_epsilon, meta.box_epsilon, meta.box_epsilon});
+    data.grid().orientation.assign(n, vs::Tensor::identity());
+    int offset = meta.box_points;
+    for (const auto& arm : meta.arms) {
+        std::copy(
+            arm->grid().epsilon.begin(), arm->grid().epsilon.end(),
+            data.grid().epsilon.begin() + offset);
+        offset += arm->meta().num_pts;
+    }
     UpdatePosOp<Drone, ActSrcDrone>()(data);
 }
 
@@ -299,6 +439,14 @@ void UpdatePosOp<Drone, ActSrcDrone>::operator()(Drone::DataType& data)
         std::copy(
             positions.begin(), positions.end(), grid.vel_pos.begin() + offset);
         offset += static_cast<int>(positions.size());
+    }
+    const auto& m = data.meta();
+    const auto t = data.sim().time().current_time() +
+                   0.5_rt * sector::timestep_width(data.sim());
+    for (int i = 0; i < static_cast<int>(m.body_points.size()); ++i) {
+        grid.pos[i] = m.body_motion->position(t) +
+                      (m.body_motion->orientation(t) & m.body_points[i]);
+        grid.vel_pos[offset + i] = grid.pos[i];
     }
 }
 
@@ -335,6 +483,39 @@ void ComputeForceOp<Drone, ActSrcDrone>::operator()(Drone::DataType& data)
             meta.total_moment - rotor_meta.integrated_moment -
             ((rotor_meta.center - drone_center) ^ rotor_meta.integrated_force);
     }
+    auto& grid = data.grid();
+    const auto rotation = meta.body_motion->orientation(midpoint_time);
+    const auto translation =
+        meta.body_motion->translation_velocity(midpoint_time);
+    const auto omega = meta.body_motion->angular_velocity(midpoint_time);
+    const int offset = grid.vel.size() - grid.pos.size();
+    VecList relative(grid.pos.size());
+    for (int i = 0; i < static_cast<int>(grid.pos.size()); ++i) {
+        relative[i] = grid.vel[offset + i] - translation -
+                      (omega ^ (grid.pos[i] - drone_center));
+        if (i < meta.box_points)
+            grid.force[i] = -0.5_rt * meta.box_drag_area *
+                            vs::mag(relative[i]) * relative[i];
+    }
+    int point = meta.box_points;
+    for (int a = 0; a < static_cast<int>(meta.arms.size()); ++a) {
+        auto& arm = *meta.arms[a];
+        const auto frame = rotation & meta.arm_frames[a];
+        for (int i = 0; i < arm.meta().num_pts; ++i)
+            arm.grid().vel[i] = relative[point + i] & frame;
+        ComputeForceOp<FixedWing, ActSrcLine>()(arm);
+        for (int i = 0; i < arm.meta().num_pts; ++i, ++point) {
+            grid.force[point] = frame & arm.grid().force[i];
+            grid.orientation[point] =
+                arm.grid().orientation[i] &
+                vs::Tensor(frame.cx(), frame.cy(), frame.cz());
+        }
+    }
+    for (int i = 0; i < static_cast<int>(grid.pos.size()); ++i) {
+        meta.total_force = meta.total_force - grid.force[i];
+        meta.total_moment =
+            meta.total_moment - ((grid.pos[i] - drone_center) ^ grid.force[i]);
+    }
 }
 
 void ProcessOutputsOp<Drone, ActSrcDrone>::prepare_outputs(
@@ -355,6 +536,7 @@ void ProcessOutputsOp<Drone, ActSrcDrone>::write_outputs()
 
 void ActSrcOp<Drone, ActSrcDrone>::initialize()
 {
+    m_structure.initialize();
     for (auto& rotor : m_data.meta().rotors) {
         rotor->source.initialize();
     }
@@ -362,6 +544,10 @@ void ActSrcOp<Drone, ActSrcDrone>::initialize()
 
 void ActSrcOp<Drone, ActSrcDrone>::setup_op()
 {
+    // Positions already use the midpoint; prevent the line source averaging
+    // twice.
+    m_structure.setup_op();
+    m_structure.setup_op();
     for (auto& rotor : m_data.meta().rotors) {
         rotor->source.setup_op();
     }
@@ -370,6 +556,7 @@ void ActSrcOp<Drone, ActSrcDrone>::setup_op()
 void ActSrcOp<Drone, ActSrcDrone>::operator()(
     const int lev, const amrex::MFIter& mfi, const amrex::Geometry& geom)
 {
+    m_structure(lev, mfi, geom);
     for (auto& rotor : m_data.meta().rotors) {
         rotor->source(lev, mfi, geom);
     }

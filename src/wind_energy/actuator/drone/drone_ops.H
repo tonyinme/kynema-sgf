@@ -3,6 +3,7 @@
 
 #include "src/wind_energy/actuator/drone/Drone.H"
 #include "src/wind_energy/actuator/actuator_ops.H"
+#include "src/wind_energy/actuator/ActSrcLineOp.H"
 
 namespace kynema_sgf::actuator::ops {
 
@@ -71,7 +72,8 @@ template <>
 class ActSrcOp<Drone, ActSrcDrone>
 {
 public:
-    explicit ActSrcOp(Drone::DataType& data) : m_data(data) {}
+    explicit ActSrcOp(Drone::DataType& data) : m_data(data), m_structure(data)
+    {}
     void initialize();
     void setup_op();
     void
@@ -79,6 +81,7 @@ public:
 
 private:
     Drone::DataType& m_data;
+    ActSrcOp<Drone, ActSrcLine> m_structure;
 };
 
 } // namespace kynema_sgf::actuator::ops

@@ -6,6 +6,8 @@
 #include "src/wind_energy/actuator/sector/actuator_sector_ops.H"
 #include "src/wind_energy/actuator/motion/RigidBodyMotion.H"
 #include "src/wind_energy/actuator/motion/RotorMotion.H"
+#include "src/wind_energy/actuator/wing/FixedWing.H"
+#include "src/wind_energy/actuator/FLLC.H"
 
 #include <memory>
 #include <string>
@@ -28,6 +30,11 @@ struct DroneRotor
 //! Composite actuator that gives all child rotors one rigid-body motion
 struct DroneData
 {
+    VecList body_points;
+    TensorList arm_frames;
+    amrex::Vector<std::unique_ptr<FixedWing::DataType>> arms;
+    int box_points{0};
+    amrex::Real box_drag_area{0}, box_epsilon{0};
     int num_rotors{0};
     RealList arm_lengths;
     RealList arm_angles_degrees;

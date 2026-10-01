@@ -633,6 +633,85 @@ its own signed speed, azimuth, hub location, and blade-mirroring choice. Rotor
 aerodynamic and force-projection inputs use the ``Actuator.Drone`` namespace
 and are passed directly to every child sector.
 
+Optional box and arm forces
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The drone may also contain a rectangular drag body and wing-style arms.
+Omit ``body_dimensions`` to retain the rotor-only behavior.
+Locations are in the drone frame; existing drone motion and rotor layout
+apply to the structure. Forces and moments in the drone output include the
+structure and remain density-normalized, as for the rotors.
+
+Required body inputs (under ``Actuator.Drone`` or ``Actuator.<name>``):
+
+* ``body_dimensions``: length and width [m].
+* ``body_num_points``: positive integer counts M and N; one point per patch.
+* ``body_cd``: nonnegative drag coefficient based on total planform area.
+* ``body_epsilon``: a scalar requested width [m], or ``momentum_thickness``.
+
+Optional body inputs:
+
+* ``body_offset``: center relative to the drone reference point [m], default zero.
+* ``body_orientation``: intrinsic roll, pitch, yaw [degrees], default zero.
+* ``body_epsilon_min``: absolute minimum width [m], default zero.
+* ``body_nonlinear_limit``: positive dimensionless limit, default 0.38.
+
+Each point represents area ``A = length*width/(M*N)``.
+The density-normalized force on the fluid is ``-0.5*Cd*A*|u_rel|*u_rel``.
+In ``momentum_thickness`` mode, the requested width is ``sqrt(2*Cd*A/pi)``.
+Both modes use the largest of the requested width, ``body_epsilon_min``,
+and ``1.001*sqrt(Cd*A/(2*body_nonlinear_limit))``.
+The final width must be finite and positive, including for a zero-drag body.
+The rectangle's thickness and side faces are not represented.
+
+Add an airfoil table under ``Actuator.Drone.arm`` or ``Actuator.<name>.arm``
+to enable arms. The instance namespace overrides shared defaults.
+The supported wing-section inputs are ``num_points`` (at least two),
+``span_locs`` (strictly increasing from zero to one), ``chord``, ``pitch``,
+``airfoil_table``, ``airfoil_type``, ``epsilon`` and ``epsilon_chord``.
+Airfoil loading, lift/drag calculations, endpoint quadrature and directional
+smoothing follow the fixed-wing model. There is no separate arm Cd input or
+box-style smoothing rule on the arms. Independent wing motion, pitch histories,
+FLLC and two-dimensional projection options are not part of this interface.
+
+One arm is generated for each existing rotor hub, including unequal arm
+lengths or explicit ``arm_angles_degrees``. Its default start is the exit
+from the box along the ray from the drone reference point to the hub.
+For this automatic construction, the box must contain the reference point,
+the hub ray must lie in the box plane, and the hub must lie outside the box.
+Optional ``arm.start`` and ``arm.end`` override reference endpoints [m];
+they rotate by each rotor's body-frame layout angle, not its blade azimuth.
+The zero-pitch chord is perpendicular to the arm span in the drone x-y plane;
+vertical reference arms are unsupported. Motor housings are not generated.
+
+The drone supplies relative velocities including translation and rotation;
+the wing calculation is performed in a stationary local section frame.
+The standard actuator-line Gaussian kernel is used for all structural points.
+Resolve the specified widths on the CFD grid and keep kernel support within
+the domain when checking integrated loads. Structural sampling and deposition
+use the drone timestep midpoint. The structural search region conservatively
+covers the domain so moving supports cannot be omitted by process selection.
+
+For example, add the following to an existing drone input::
+
+   Actuator.Drone.body_dimensions = 0.025 0.025
+   Actuator.Drone.body_num_points = 3 3
+   Actuator.Drone.body_cd = 1.2
+   Actuator.Drone.body_epsilon = momentum_thickness
+   Actuator.Drone.body_epsilon_min = 0.003
+   Actuator.Drone.body_nonlinear_limit = 0.38
+   Actuator.Drone.arm.num_points = 16
+   Actuator.Drone.arm.span_locs = 0 1
+   Actuator.Drone.arm.chord = 0.003 0.003
+   Actuator.Drone.arm.pitch = 0
+   Actuator.Drone.arm.airfoil_table = flat_plate.dat
+   Actuator.Drone.arm.airfoil_type = openfast
+   Actuator.Drone.arm.epsilon = 0.003
+
+The table file must cover the angles of attack encountered by the arms.
+The dimensions and coefficient above are illustrative, not calibrated.
+
+
 The drone center is the origin of its body frame. Arms lie in the body x-y
 plane, and each rotor axis initially points along body +z. Viewed from body +z,
 positive arm angles proceed from body +x toward body +y::
