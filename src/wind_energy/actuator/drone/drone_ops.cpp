@@ -110,27 +110,17 @@ void read_structure(Drone::DataType& data, const utils::ActParser& pp)
     if (!arm.contains("airfoil_table")) {
         return;
     }
-    for (const auto* key :
-         {"motion_type", "velocity", "pitch_timetable", "active_force_dirs",
-          "prescribed_uinf"}) {
-        if (arm.contains(key)) {
-            input_error(
-                data.info().label,
-                std::string("arm.") + key +
-                    " is not supported for drone-owned arms");
-        }
+    // Supply generated geometry to the unchanged wing reader.
+    const auto prefix = "Actuator." + data.info().label + ".arm";
+    const auto section_prefix = prefix + "_section";
+    amrex::ParmParse section(section_prefix);
+    for (const auto& name : amrex::ParmParse::getEntries(prefix)) {
+        amrex::Vector<std::string> values;
+        const auto key = name.substr(prefix.size() + 1);
+        arm.params().getarr(key, values);
+        section.addarr(key, values);
     }
-    for (const auto* key : {"fllc", "disable_spanwise_gaussian"}) {
-        bool enabled = false;
-        arm.query(key, enabled);
-        if (enabled) {
-            input_error(
-                data.info().label,
-                std::string("arm.") + key +
-                    " is not yet connected to the drone adapter; use a "
-                    "standalone wing for this option");
-        }
-    }
+    const utils::ActParser wing_pp("Actuator.Drone.arm", section_prefix);
     for (const auto& rotor : m.rotors) {
         auto wing = std::make_unique<FixedWing::DataType>(
             data.sim(), data.info().label + ".arm", data.info().id);
@@ -177,27 +167,14 @@ void read_structure(Drone::DataType& data, const utils::ActParser& pp)
             vs::mag(chord) > 0, "Vertical reference arms are not supported");
         vs::Tensor frame;
         frame.cols(chord, span, chord ^ span);
-        w.start = vs::Vector::zero();
-        w.end = {0, length, 0};
-        read_wing_section_inputs(w, arm);
+        section.addarr("start", RealList{0, 0, 0});
+        section.addarr("end", RealList{0, length, 0});
+        ReadInputsOp<FixedWing, ActSrcLine>()(*wing, wing_pp);
         AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
-            w.num_pts >= 2 && w.chord_inp.size() == w.span_locs.size(),
-            "arm.num_points must be at least two; chord and span_locs must "
-            "have matching lengths");
+            w.num_pts >= 2, "arm.num_points must be at least two");
         AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
-            w.span_locs.size() >= 2 && w.span_locs.front() == 0 &&
-                w.span_locs.back() == 1 && std::isfinite(w.pitch),
-            "arm.span_locs must cover [0,1]; arm.pitch must be finite");
-        for (int i = 0; i < static_cast<int>(w.span_locs.size()); ++i) {
-            AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
-                std::isfinite(w.chord_inp[i]) && w.chord_inp[i] > 0,
-                "arm.chord must be finite and positive");
-            if (i > 0) {
-                AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
-                    w.span_locs[i] > w.span_locs[i - 1],
-                    "arm.span_locs must be strictly increasing");
-            }
-        }
+            amrex::toLower(w.motion_type) == "none",
+            "Arms follow the drone motion; arm.motion_type must be none");
         InitDataOp<FixedWing, ActSrcLine>()(*wing);
         for (int i = 0; i < w.num_pts; ++i) {
             for (auto e : wing->grid().epsilon[i]) {
@@ -560,6 +537,7 @@ void ComputeForceOp<Drone, ActSrcDrone>::operator()(Drone::DataType& data)
         const auto frame = rotation & meta.arm_frames[a];
         for (int i = 0; i < arm.meta().num_pts; ++i)
             arm.grid().vel[i] = relative[point + i] & frame;
+        UpdateVelOp<FixedWing, ActSrcLine>()(arm);
         ComputeForceOp<FixedWing, ActSrcLine>()(arm);
         for (int i = 0; i < arm.meta().num_pts; ++i, ++point) {
             grid.force[point] = frame & arm.grid().force[i];
@@ -593,7 +571,13 @@ void ProcessOutputsOp<Drone, ActSrcDrone>::write_outputs()
 
 void ActSrcOp<Drone, ActSrcDrone>::initialize()
 {
-    m_structure.initialize();
+    m_points.resize(m_data.grid().pos.size());
+    m_device_points.resize(m_points.size());
+    int point = m_data.meta().box_points;
+    for (const auto& arm : m_data.meta().arms) {
+        for (int i = 0; i < arm->meta().num_pts; ++i)
+            m_points[point++].dcoord_flags = arm->grid().dcoord_flags;
+    }
     for (auto& rotor : m_data.meta().rotors) {
         rotor->source.initialize();
     }
@@ -601,7 +585,17 @@ void ActSrcOp<Drone, ActSrcDrone>::initialize()
 
 void ActSrcOp<Drone, ActSrcDrone>::setup_op()
 {
-    m_structure.setup_op();
+    const auto& grid = m_data.grid();
+    for (int i = 0; i < static_cast<int>(m_points.size()); ++i) {
+        auto& point = m_points[i];
+        point.pos = grid.pos[i];
+        point.force = grid.force[i];
+        point.epsilon = grid.epsilon[i];
+        point.orientation = grid.orientation[i];
+    }
+    amrex::Gpu::copy(
+        amrex::Gpu::hostToDevice, m_points.begin(), m_points.end(),
+        m_device_points.begin());
     for (auto& rotor : m_data.meta().rotors) {
         rotor->source.setup_op();
     }
@@ -610,10 +604,32 @@ void ActSrcOp<Drone, ActSrcDrone>::setup_op()
 void ActSrcOp<Drone, ActSrcDrone>::operator()(
     const int lev, const amrex::MFIter& mfi, const amrex::Geometry& geom)
 {
-    m_structure(lev, mfi, geom);
     for (auto& rotor : m_data.meta().rotors) {
         rotor->source(lev, mfi, geom);
     }
+    if (m_points.empty()) return;
+    // Drone positions already use the sector sampling time.
+    const auto src =
+        m_data.sim().repo().get_field("actuator_src_term")(lev).array(mfi);
+    const auto lo = geom.ProbLoArray();
+    const auto dx = geom.CellSizeArray();
+    const int npts = m_device_points.size();
+    const auto* points = m_device_points.data();
+    amrex::ParallelFor(
+        mfi.tilebox(), [=] AMREX_GPU_DEVICE(int i, int j, int k) {
+            const vs::Vector x{
+                lo[0] + (i + 0.5_rt) * dx[0], lo[1] + (j + 0.5_rt) * dx[1],
+                lo[2] + (k + 0.5_rt) * dx[2]};
+            vs::Vector force = vs::Vector::zero();
+            for (int ip = 0; ip < npts; ++ip) {
+                const auto& p = points[ip];
+                const auto dist =
+                    (p.orientation & (x - p.pos)) * p.dcoord_flags;
+                force = force + utils::gaussian3d(dist, p.epsilon) * p.force;
+            }
+            for (int d = 0; d < AMREX_SPACEDIM; ++d)
+                src(i, j, k, d) += force[d];
+        });
 }
 
 } // namespace kynema_sgf::actuator::ops

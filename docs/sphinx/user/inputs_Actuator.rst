@@ -684,24 +684,11 @@ The exact lower bound is allowed; no extra multiplicative margin is applied.
 The final width must be finite and positive, including for a zero-drag body.
 The rectangle's thickness and side faces are not represented.
 
-Add an airfoil table under ``Actuator.Drone.arm`` or ``Actuator.<name>.arm``
-to enable arms. The instance namespace overrides shared defaults.
-The supported wing-section inputs are ``num_points`` (at least two),
-``span_locs`` (strictly increasing from zero to one), ``chord``, ``pitch``,
-``airfoil_table``, ``airfoil_type``, ``epsilon`` and ``epsilon_chord``.
-Airfoil loading, lift/drag calculations, endpoint quadrature and directional
-smoothing follow the fixed-wing model. There is no separate arm Cd input or
-box-style smoothing rule on the arms. Independent wing motion and pitch
-histories are not supported by this drone-owned arm interface.
-The current adapter does not yet call the FLLC correction step or carry
-per-arm two-dimensional projection flags into its combined source grid.
-Consequently, enabling ``fllc`` or ``disable_spanwise_gaussian`` reports an
-error rather than silently omitting the requested behavior.
-Explicitly setting either option to false is accepted; ``normalize_spanwise``
-has no effect with spanwise Gaussian spreading enabled.
-These are limitations of the current adapter, not the standalone wing model.
-Section inputs share the fixed-wing parser, including its default
-``span_locs = 0 1`` and ``chord = 1 1``; specify the physical arm chord.
+Set ``airfoil_table`` under ``Actuator.Drone.arm`` or ``Actuator.<name>.arm``
+to enable arms; instance inputs override defaults.
+Arms use the standard fixed-wing ALM inputs and aerodynamics, including FLLC,
+pitch tables and 2D projection. Specify the physical ``chord`` and at least
+two ``num_points``. Arm motion follows the drone (``motion_type = none``).
 
 One arm is generated for each existing rotor hub, including unequal arm
 lengths or explicit ``arm_angles_degrees``. Its default start is the exit
@@ -715,7 +702,7 @@ vertical reference arms are unsupported. Motor housings are not generated.
 
 The drone supplies relative velocities including translation and rotation;
 the wing calculation is performed in a stationary local section frame.
-The standard actuator-line Gaussian kernel is used for all structural points.
+Structural forces use the same Gaussian function as the actuator-line model.
 Resolve the specified widths on the CFD grid and keep kernel support within
 the domain when checking integrated loads. Structural sampling and deposition
 use the drone timestep midpoint. The structural search region conservatively

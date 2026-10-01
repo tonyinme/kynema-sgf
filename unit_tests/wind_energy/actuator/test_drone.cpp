@@ -3,6 +3,7 @@
 #include "src/wind_energy/actuator/Actuator.H"
 #include "src/wind_energy/actuator/ActuatorContainer.H"
 #include "src/wind_energy/actuator/ActuatorModel.H"
+#include "src/wind_energy/actuator/wing/fixed_wing_ops.H"
 #include "src/utilities/sampling/MovingPlaneSampler.H"
 #include "src/utilities/sampling/MovingVolumeSampler.H"
 #include "src/utilities/sampling/Sampling.H"
@@ -823,6 +824,22 @@ TEST_F(
         EXPECT_LE(area / (2 * eps * eps), 0.38 + 1e-14);
         EXPECT_NEAR(eps, std::sqrt(area / 0.76), 1e-12);
         EXPECT_EQ(grid.pos.size(), n * n);
+        // Broaden the test kernel enough to resolve it on this coarse mesh.
+        grid.epsilon.assign(grid.pos.size(), Vector{0.04_rt, 0.04_rt, 0.04_rt});
+        for (auto& rotor : data.meta().rotors)
+            std::fill(
+                rotor->data.grid().force.begin(),
+                rotor->data.grid().force.end(), Vector::zero());
+        act::ops::ActSrcOp<act::Drone, act::ActSrcDrone> source(data);
+        source.initialize();
+        source.setup_op();
+        auto& field = sim().repo().get_field("actuator_src_term");
+        field.setVal(0.0_rt);
+        const auto& geom = sim().mesh().Geom(0);
+        for (amrex::MFIter mfi(field(0)); mfi.isValid(); ++mfi)
+            source(0, mfi, geom);
+        const auto dx = geom.CellSizeArray();
+        EXPECT_NEAR(field(0).sum(2) * dx[0] * dx[1] * dx[2], sum.z(), 1e-8);
     }
     pp.add("body_epsilon", 0.04_rt);
     pp.add("body_epsilon_min", 0.05_rt);
@@ -833,100 +850,7 @@ TEST_F(
     remove(m_airfoil_file.c_str());
 }
 
-TEST_F(DroneActuatorTest, wing_arms_follow_rotating_drone_and_use_airfoil_loads)
-{
-    namespace act = kynema_sgf::actuator;
-    using kynema_sgf::vs::Vector;
-    // Constant lift and drag make the expected ALM loads analytic.
-    std::ofstream(m_airfoil_file)
-        << "! test polar\n3 NumAlf\n! Alpha Cl Cd Cm\n! deg - - -\n"
-           "-180 0.4 1.2 0\n0 0.4 1.2 0\n180 0.4 1.2 0\n";
-    initialize_domain();
-    populate_inputs();
-    amrex::ParmParse pp("Actuator.D1");
-    pp.addarr("body_dimensions", act::RealList{0.025_rt, 0.025_rt});
-    pp.addarr("body_num_points", amrex::Vector<int>{3, 3});
-    pp.add("body_cd", 1.2_rt);
-    pp.add("body_epsilon", std::string("momentum_thickness"));
-    pp.addarr("body_orientation_degrees", act::RealList{20, 30, 40});
-    pp.addarr("angular_velocity", act::RealList{3, -2, 4});
-    amrex::ParmParse arm("Actuator.D1.arm");
-    arm.add("num_points", 5);
-    arm.add("pitch", 0.0_rt);
-    arm.add("fllc", false);
-    arm.add("disable_spanwise_gaussian", false);
-    arm.add("normalize_spanwise", true);
-    arm.add("epsilon", 0.01_rt);
-    arm.addarr("chord", act::RealList{0.003_rt, 0.003_rt});
-    arm.add("airfoil_table", m_airfoil_file);
-    act::Drone::DataType data(sim(), "D1", 0);
-    act::ops::ReadInputsOp<act::Drone, act::ActSrcDrone>()(
-        data, act::utils::ActParser("Actuator.Drone", "Actuator.D1"));
-    act::ops::InitDataOp<act::Drone, act::ActSrcDrone>()(data);
-    ASSERT_EQ(data.meta().arms.size(), 4U);
-    auto& grid = data.grid();
-    auto& m = data.meta();
-    const auto t = sim().time().current_time() +
-                   0.5_rt * act::sector::timestep_width(sim());
-    const auto r = m.body_motion->orientation(t);
-    const auto c = m.body_motion->position(t);
-    const auto v = m.body_motion->translation_velocity(t);
-    const auto omega = m.body_motion->angular_velocity(t);
-    const int offset = grid.vel.size() - grid.pos.size();
-    for (int pass = 0; pass < 2; ++pass) {
-        const Vector downwash = r & Vector{0, 0, pass ? 5.0_rt : 0.0_rt};
-        for (int i = 0; i < static_cast<int>(grid.pos.size()); ++i) {
-            grid.vel[offset + i] = v + (omega ^ (grid.pos[i] - c)) + downwash;
-            EXPECT_NEAR(
-                kynema_sgf::vs::mag(grid.pos[i] - (c + (r & m.body_points[i]))),
-                0, 1e-12);
-        }
-        act::ops::ComputeForceOp<act::Drone, act::ActSrcDrone>()(data);
-        Vector total;
-        for (const auto& f : grid.force) {
-            total = total + f;
-        }
-        const auto arm_length = 0.075 - std::sqrt(2.0) * 0.0125;
-        const auto area = 0.025 * 0.025 + 4 * arm_length * 0.003;
-        const auto expected =
-            -0.5 * 1.2 * area * (pass ? 25 : 0) * (r & Vector::khat());
-        EXPECT_NEAR(kynema_sgf::vs::mag(total - expected), 0, 1e-11);
-        Vector vehicle = m.total_force;
-        for (auto& rotor : m.rotors) {
-            vehicle = vehicle + rotor->data.meta().integrated_force;
-        }
-        EXPECT_NEAR(kynema_sgf::vs::mag(vehicle + total), 0, 1e-10);
-        int point = m.box_points;
-        Vector vehicle_moment = m.total_moment;
-        for (auto& rotor : m.rotors) {
-            const auto& rm = rotor->data.meta();
-            vehicle_moment = vehicle_moment + rm.integrated_moment +
-                             ((rm.center - c) ^ rm.integrated_force);
-        }
-        const auto yaw_load = 0.5 * (pass ? 25 : 0) * 0.4 * 0.003 * 4 *
-                              (0.075 * 0.075 - 2 * 0.0125 * 0.0125) / 2;
-        EXPECT_NEAR(
-            kynema_sgf::vs::mag(
-                vehicle_moment - yaw_load * (r & Vector::khat())),
-            0, 1e-11);
-        for (int a = 0; a < 4; ++a) {
-            const auto frame = r & m.arm_frames[a];
-            const auto& wing = m.arms[a]->meta();
-            for (int i = 0; i < wing.num_pts; ++i, ++point) {
-                const auto q = 0.5 * (pass ? 25 : 0) * 0.003 * wing.dx[i];
-                const auto expected_point =
-                    frame & Vector{0.4 * q, 0, -1.2 * q};
-                EXPECT_NEAR(
-                    kynema_sgf::vs::mag(grid.force[point] - expected_point), 0,
-                    1e-12);
-            }
-        }
-    }
-    remove(m_airfoil_file.c_str());
-}
-
-TEST_F(
-    DroneActuatorTest, structural_projection_conserves_force_without_motion_lag)
+TEST_F(DroneActuatorTest, arms_match_standard_wing_with_fllc_and_2d_projection)
 {
     namespace act = kynema_sgf::actuator;
     using kynema_sgf::vs::Vector;
@@ -935,57 +859,76 @@ TEST_F(
     populate_inputs();
     amrex::ParmParse pp("Actuator.D1");
     pp.addarr("body_dimensions", act::RealList{0.025_rt, 0.025_rt});
-    pp.addarr("body_num_points", amrex::Vector<int>{1, 1});
+    pp.addarr("body_num_points", amrex::Vector<int>{3, 3});
     pp.add("body_cd", 1.2_rt);
     pp.add("body_epsilon", 0.04_rt);
+    pp.addarr("body_orientation_degrees", act::RealList{20, 30, 40});
+    pp.addarr("angular_velocity", act::RealList{3, -2, 4});
+    amrex::ParmParse defaults("Actuator.Drone.arm");
+    defaults.add("num_points", 5);
+    defaults.add("pitch", 5.0_rt);
+    defaults.add("epsilon", 0.01_rt);
+    defaults.add("epsilon_chord", 0.25_rt);
+    defaults.add("fllc", true);
+    defaults.add("fllc_start_time", -1.0_rt);
+    defaults.add("airfoil_table", m_airfoil_file);
+    amrex::ParmParse arm("Actuator.D1.arm");
+    arm.add("pitch", 10.0_rt);
+    arm.add("disable_spanwise_gaussian", true);
+    arm.addarr("chord", act::RealList{0.003_rt, 0.003_rt});
     act::Drone::DataType data(sim(), "D1", 0);
     act::ops::ReadInputsOp<act::Drone, act::ActSrcDrone>()(
         data, act::utils::ActParser("Actuator.Drone", "Actuator.D1"));
     act::ops::InitDataOp<act::Drone, act::ActSrcDrone>()(data);
-    act::ops::ActSrcOp<act::Drone, act::ActSrcDrone> source(data);
-    source.initialize();
-    act::ops::ActSrcOp<act::Drone, act::ActSrcLine> endpoint_source(data);
-    endpoint_source.initialize();
-    auto& field = sim().repo().get_field("actuator_src_term");
-    const auto& geom = sim().mesh().Geom(0);
-    const auto dx = geom.CellSizeArray();
-    const auto lo = geom.ProbLoArray();
-    for (bool midpoint : {true, false}) {
-        for (int step = 0; step < 2; ++step) {
-            const Vector point{step * 0.03_rt, 0, 0};
-            data.grid().pos[0] = point;
-            data.grid().force[0] = {0, 0, -1};
-            field.setVal(0.0_rt);
-            if (midpoint)
-                source.setup_op();
-            else
-                endpoint_source.setup_op();
-            for (amrex::MFIter mfi(field(0)); mfi.isValid(); ++mfi) {
-                if (midpoint)
-                    source(0, mfi, geom);
-                else
-                    endpoint_source(0, mfi, geom);
-            }
-            EXPECT_NEAR(field(0).sum(2) * dx[0] * dx[1] * dx[2], -1.0, 2e-6);
-            // Default wings still average endpoints; drone positions are
-            // already midpoints.
-            const Vector expected_position = midpoint ? point : 0.5_rt * point;
-            for (amrex::MFIter mfi(field(0)); mfi.isValid(); ++mfi) {
-                const auto a = field(0).array(mfi);
-                amrex::ParallelFor(
-                    mfi.validbox(), [=] AMREX_GPU_DEVICE(int i, int j, int k) {
-                        const Vector x{
-                            lo[0] + (i + 0.5_rt) * dx[0],
-                            lo[1] + (j + 0.5_rt) * dx[1],
-                            lo[2] + (k + 0.5_rt) * dx[2]};
-                        a(i, j, k, 2) += act::utils::gaussian3d(
-                            x - expected_position,
-                            Vector{0.04_rt, 0.04_rt, 0.04_rt});
-                    });
-            }
-            EXPECT_LT(field(0).norm0(2), 1e-10);
+    auto& m = data.meta();
+    ASSERT_EQ(m.arms.size(), 4U);
+    act::FixedWing::DataType reference(sim(), "reference", 1);
+    const auto& first = *m.arms.front();
+    arm.addarr("start", act::RealList{0, 0, 0});
+    arm.addarr("end", act::RealList{0, first.meta().end.y(), 0});
+    act::ops::ReadInputsOp<act::FixedWing, act::ActSrcLine>()(
+        reference,
+        act::utils::ActParser("Actuator.Drone.arm", "Actuator.D1.arm"));
+    act::ops::InitDataOp<act::FixedWing, act::ActSrcLine>()(reference);
+    const auto t = sim().time().current_time() +
+                   0.5_rt * act::sector::timestep_width(sim());
+    const auto r = m.body_motion->orientation(t);
+    const auto c = m.body_motion->position(t);
+    const auto v = m.body_motion->translation_velocity(t);
+    const auto omega = m.body_motion->angular_velocity(t);
+    auto& grid = data.grid();
+    const int offset = grid.vel.size() - grid.pos.size();
+    // The first pass initializes FLLC; the second applies its correction.
+    for (int pass = 0; pass < 2; ++pass) {
+        const Vector wind{5, 0, 1};
+        std::fill(
+            reference.grid().vel.begin(), reference.grid().vel.end(), wind);
+        act::ops::UpdateVelOp<act::FixedWing, act::ActSrcLine>()(reference);
+        act::ops::ComputeForceOp<act::FixedWing, act::ActSrcLine>()(reference);
+        int point = m.box_points;
+        for (int a = 0; a < 4; ++a) {
+            const auto frame = r & m.arm_frames[a];
+            for (int i = 0; i < first.meta().num_pts; ++i, ++point)
+                grid.vel[offset + point] =
+                    v + (omega ^ (grid.pos[point] - c)) + (frame & wind);
+        }
+        act::ops::ComputeForceOp<act::Drone, act::ActSrcDrone>()(data);
+        point = m.box_points;
+        for (int a = 0; a < 4; ++a) {
+            const auto frame = r & m.arm_frames[a];
+            EXPECT_TRUE(m.arms[a]->meta().fllc->initialized);
+            EXPECT_EQ(m.arms[a]->meta().pitch, 10.0_rt);
+            EXPECT_EQ(m.arms[a]->grid().dcoord_flags.y(), 0.0_rt);
+            for (int i = 0; i < first.meta().num_pts; ++i, ++point)
+                EXPECT_NEAR(
+                    kynema_sgf::vs::mag(
+                        grid.force[point] -
+                        (frame & reference.grid().force[i])),
+                    0, 1e-12);
         }
     }
+    EXPECT_GT(
+        kynema_sgf::vs::mag(first.meta().fllc->correction_velocity[0]), 0);
     remove(m_airfoil_file.c_str());
 }
 

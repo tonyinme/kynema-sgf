@@ -3,7 +3,6 @@
 
 #include "src/wind_energy/actuator/drone/Drone.H"
 #include "src/wind_energy/actuator/actuator_ops.H"
-#include "src/wind_energy/actuator/ActSrcLineOp.H"
 
 namespace kynema_sgf::actuator::ops {
 
@@ -72,9 +71,7 @@ template <>
 class ActSrcOp<Drone, ActSrcDrone>
 {
 public:
-    explicit ActSrcOp(Drone::DataType& data)
-        : m_data(data), m_structure(data, LineSourcePosition::midpoint)
-    {}
+    explicit ActSrcOp(Drone::DataType& data) : m_data(data) {}
     void initialize();
     void setup_op();
     void
@@ -82,7 +79,14 @@ public:
 
 private:
     Drone::DataType& m_data;
-    ActSrcOp<Drone, ActSrcLine> m_structure;
+    struct SourcePoint
+    {
+        vs::Vector pos, force, epsilon;
+        vs::Vector dcoord_flags{1, 1, 1};
+        vs::Tensor orientation;
+    };
+    amrex::Vector<SourcePoint> m_points;
+    amrex::Gpu::DeviceVector<SourcePoint> m_device_points;
 };
 
 } // namespace kynema_sgf::actuator::ops
