@@ -820,8 +820,8 @@ TEST_F(
         EXPECT_NEAR(sum.x(), 0, 1e-12);
         const auto eps = data.meta().box_epsilon;
         const auto area = 1.2 * 0.025 * 0.025 / (n * n);
-        EXPECT_LT(area / (2 * eps * eps), 0.38);
-        EXPECT_NEAR(eps, 1.001 * std::sqrt(area / 0.76), 1e-12);
+        EXPECT_LE(area / (2 * eps * eps), 0.38 + 1e-14);
+        EXPECT_NEAR(eps, std::sqrt(area / 0.76), 1e-12);
         EXPECT_EQ(grid.pos.size(), n * n);
     }
     pp.add("body_epsilon", 0.04_rt);
@@ -853,6 +853,9 @@ TEST_F(DroneActuatorTest, wing_arms_follow_rotating_drone_and_use_airfoil_loads)
     amrex::ParmParse arm("Actuator.D1.arm");
     arm.add("num_points", 5);
     arm.add("pitch", 0.0_rt);
+    arm.add("fllc", false);
+    arm.add("disable_spanwise_gaussian", false);
+    arm.add("normalize_spanwise", true);
     arm.add("epsilon", 0.01_rt);
     arm.addarr("chord", act::RealList{0.003_rt, 0.003_rt});
     arm.add("airfoil_table", m_airfoil_file);

@@ -659,8 +659,28 @@ Optional body inputs:
 Each point represents area ``A = length*width/(M*N)``.
 The density-normalized force on the fluid is ``-0.5*Cd*A*|u_rel|*u_rel``.
 In ``momentum_thickness`` mode, the requested width is ``sqrt(2*Cd*A/pi)``.
-Both modes use the largest of the requested width, ``body_epsilon_min``,
-and ``1.001*sqrt(Cd*A/(2*body_nonlinear_limit))``.
+The nonlinear-limit parameter bounds the dimensionless drag loading at each
+body point. With :math:`\lambda` denoting ``body_nonlinear_limit`` (default 0.38),
+
+.. math::
+
+   \frac{C_d A}{2\epsilon^2} \leq \lambda,
+   \qquad
+   \epsilon \geq \sqrt{\frac{C_d A}{2\lambda}}.
+
+Both smoothing modes therefore use
+
+.. math::
+
+   \epsilon = \max\!\left(
+       \epsilon_{\mathrm{requested}},\;
+       \epsilon_{\min},\;
+       \sqrt{\frac{C_d A}{2\lambda}}
+   \right).
+
+Here :math:`A=LW/(MN)` is the area of one body patch and
+:math:`\epsilon_{\min}` is ``body_epsilon_min``.
+The exact lower bound is allowed; no extra multiplicative margin is applied.
 The final width must be finite and positive, including for a zero-drag body.
 The rectangle's thickness and side faces are not represented.
 
@@ -671,8 +691,15 @@ The supported wing-section inputs are ``num_points`` (at least two),
 ``airfoil_table``, ``airfoil_type``, ``epsilon`` and ``epsilon_chord``.
 Airfoil loading, lift/drag calculations, endpoint quadrature and directional
 smoothing follow the fixed-wing model. There is no separate arm Cd input or
-box-style smoothing rule on the arms. Independent wing motion, pitch histories,
-FLLC and two-dimensional projection options are rejected by this interface.
+box-style smoothing rule on the arms. Independent wing motion and pitch
+histories are not supported by this drone-owned arm interface.
+The current adapter does not yet call the FLLC correction step or carry
+per-arm two-dimensional projection flags into its combined source grid.
+Consequently, enabling ``fllc`` or ``disable_spanwise_gaussian`` reports an
+error rather than silently omitting the requested behavior.
+Explicitly setting either option to false is accepted; ``normalize_spanwise``
+has no effect with spanwise Gaussian spreading enabled.
+These are limitations of the current adapter, not the standalone wing model.
 Section inputs share the fixed-wing parser, including its default
 ``span_locs = 0 1`` and ``chord = 1 1``; specify the physical arm chord.
 

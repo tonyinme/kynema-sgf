@@ -90,8 +90,7 @@ void read_structure(Drone::DataType& data, const utils::ActParser& pp)
         std::isfinite(m.box_epsilon) && m.box_epsilon >= 0,
         "body_epsilon must be finite and nonnegative");
     m.box_epsilon = std::max(
-        {m.box_epsilon, minimum,
-         1.001_rt * std::sqrt(m.box_drag_area / (2 * limit))});
+        {m.box_epsilon, minimum, std::sqrt(m.box_drag_area / (2 * limit))});
     AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
         std::isfinite(m.box_epsilon) && m.box_epsilon > 0,
         "Final body epsilon must be finite and positive; set body_epsilon_min "
@@ -112,14 +111,24 @@ void read_structure(Drone::DataType& data, const utils::ActParser& pp)
         return;
     }
     for (const auto* key :
-         {"motion_type", "velocity", "pitch_timetable", "fllc",
-          "disable_spanwise_gaussian", "normalize_spanwise",
-          "active_force_dirs", "prescribed_uinf"}) {
+         {"motion_type", "velocity", "pitch_timetable", "active_force_dirs",
+          "prescribed_uinf"}) {
         if (arm.contains(key)) {
             input_error(
                 data.info().label,
                 std::string("arm.") + key +
                     " is not supported for drone-owned arms");
+        }
+    }
+    for (const auto* key : {"fllc", "disable_spanwise_gaussian"}) {
+        bool enabled = false;
+        arm.query(key, enabled);
+        if (enabled) {
+            input_error(
+                data.info().label,
+                std::string("arm.") + key +
+                    " is not yet connected to the drone adapter; use a "
+                    "standalone wing for this option");
         }
     }
     for (const auto& rotor : m.rotors) {
