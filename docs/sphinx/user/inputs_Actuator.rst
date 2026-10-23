@@ -481,35 +481,36 @@ Example for ``ActuatorSector``::
 
 .. input_param:: Actuator.ActuatorSector.epsilon
 
-   **type:** Real number, optional
+   **type:** Real number or three Real numbers, optional
 
-   Fixed Gaussian width in meters. At least one of ``epsilon`` or
-   ``epsilon_chord`` must be specified. When ``epsilon`` is specified, the same
-   constant width is used at every radial station. If both ``epsilon`` and
-   ``epsilon_chord`` are specified, ``epsilon`` takes precedence and a warning
-   is printed.
+   Gaussian widths in meters, ordered **chord, thickness, radial** in the
+   local blade frame, including twist, azimuth and body orientation.
+   A scalar applies to all three directions.
+   As for wings, the local width in each direction is
+   ``max(epsilon, epsilon_min, epsilon_chord * chord)``.
+   At least one of ``epsilon`` or ``epsilon_chord`` must be specified.
 
 .. input_param:: Actuator.ActuatorSector.epsilon_chord
 
-   **type:** Real number, optional
+   **type:** Real number or three Real numbers, optional
 
-   Gaussian width divided by local chord. At least one of ``epsilon`` or
-   ``epsilon_chord`` must be specified. When ``epsilon_chord`` is used, the
-   local Gaussian width is ``max(epsilon_min, epsilon_chord * chord)``.
+   Width divided by local chord, in the same chord, thickness, radial order.
+   A scalar applies to all three directions.
+   When both inputs are supplied, their componentwise maximum is used;
+   ``epsilon`` no longer overrides ``epsilon_chord``.
 
 .. input_param:: Actuator.ActuatorSector.epsilon_min
 
    **type:** Real number, optional, default = 0.0
 
-   Minimum Gaussian width in meters when using ``epsilon_chord``. This value is
-   ignored when constant ``epsilon`` is specified.
+   Minimum width in meters, applied to all three directions.
 
 .. input_param:: Actuator.ActuatorSector.epsilon_dr
 
    **type:** Real number, optional, default = 1.5
 
    Radial grid requirement. The radial grid is built automatically so that
-   ``epsilon / dr >= epsilon_dr``. Users do not specify the number of radial
+   ``epsilon_radial / dr >= epsilon_dr``. Users do not specify the number of radial
    stations directly; it is derived from the local smoothing width, chord, and
    rotor radius.
 
@@ -518,9 +519,11 @@ Example for ``ActuatorSector``::
    **type:** Real number, optional, default = 1.5
 
    Swept arc length requirement. Swept quadrature is selected automatically so
-   that ``epsilon / dl >= epsilon_dl`` over the rotor sweep in the current
+   that ``min(epsilon_chordwise, epsilon_thickness) / dl >= epsilon_dl`` over the rotor sweep in the current
    timestep. When the timestep is sufficiently small, each radial station uses
    one swept point and the projection reduces to an actuator-line-like limit.
+   NetCDF ``epsilon`` stores all three components at each radial station,
+   in chord, thickness, radial order.
 
    .. note::
 
@@ -609,7 +612,8 @@ Example for ``ActuatorSector``::
    **type:** Real number, optional, default = ``1.0e-4``
 
    Maximum absolute interpolation error for the tabulated ``exp(-x)`` Gaussian
-   kernel, where ``x = (r / epsilon)^2``. The code derives the number of table
+   kernel, where ``x = (d_c/epsilon_c)^2 + (d_t/epsilon_t)^2 + (d_r/epsilon_r)^2``
+   uses local chord, thickness and radial distances. The code derives the number of table
    intervals from the linear interpolation error bound over
    ``0 <= x <= support_radius_over_epsilon^2``.
 

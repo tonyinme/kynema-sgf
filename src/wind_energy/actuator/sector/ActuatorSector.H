@@ -106,14 +106,11 @@ struct ActuatorSectorData
     //! Sectional airfoil lookup table, returning Cl/Cd as a function of AoA
     std::unique_ptr<AirfoilTable> aflookup;
 
-    //! Fixed Gaussian width [m]
-    amrex::Real epsilon{0.0_rt};
-
-    //! True when epsilon was explicitly supplied by the user
-    bool user_epsilon{false};
+    //! Gaussian minimum widths: chord, thickness, radial [m]
+    vs::Vector epsilon{vs::Vector::zero()};
 
     //! Gaussian width divided by local chord [-]
-    amrex::Real epsilon_chord{0.0_rt};
+    vs::Vector epsilon_chord{vs::Vector::zero()};
 
     //! Minimum Gaussian width when using epsilon_chord [m]
     amrex::Real epsilon_min{0.0_rt};
@@ -161,7 +158,7 @@ struct ActuatorSectorData
     RealList twist;
 
     //! Local Gaussian width at radial stations [m]
-    RealList epsilon_profile;
+    VecList epsilon_profile;
 
     //! Number of swept quadrature samples at each radial station [-]
     amrex::Vector<int> theta_counts;

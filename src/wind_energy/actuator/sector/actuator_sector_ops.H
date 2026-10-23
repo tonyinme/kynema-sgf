@@ -172,6 +172,7 @@ private:
     DeviceVecList m_pos;
     DeviceVecList m_force;
     DeviceVecList m_epsilon;
+    DeviceTensorList m_orientation;
     amrex::Gpu::DeviceVector<amrex::Real> m_gaussian_table;
 
     void copy_to_device();

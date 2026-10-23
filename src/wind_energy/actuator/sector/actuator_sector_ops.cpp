@@ -1,4 +1,5 @@
 #include "src/wind_energy/actuator/sector/actuator_sector_ops.H"
+#include "src/wind_energy/actuator/sector/section_aerodynamics.H"
 
 #include "src/CFDSim.H"
 #include "src/core/Field.H"
@@ -25,13 +26,21 @@ amrex::Real max_interp_chord(const ActuatorSectorData& meta)
     return *std::ranges::max_element(meta.chord_inp);
 }
 
-amrex::Real
+vs::Vector
 local_epsilon(const ActuatorSectorData& meta, const amrex::Real chord)
 {
-    if (meta.user_epsilon) {
-        return meta.epsilon;
+    auto eps = meta.epsilon;
+    for (int n = 0; n < AMREX_SPACEDIM; ++n) {
+        eps[n] =
+            std::max({eps[n], meta.epsilon_min, meta.epsilon_chord[n] * chord});
     }
-    return amrex::max(meta.epsilon_min, meta.epsilon_chord * chord);
+    return eps;
+}
+
+amrex::Real max_epsilon(const ActuatorSectorData& meta)
+{
+    const auto eps = local_epsilon(meta, max_interp_chord(meta));
+    return std::max({eps.x(), eps.y(), eps.z()});
 }
 
 amrex::Real interp_metric_to_radius(
@@ -89,17 +98,17 @@ void build_radial_grid(ActuatorSectorData& meta)
     }
 
     // Build a cumulative spacing metric whose local density enforces both
-    // requested Gaussian resolution (epsilon_dr / epsilon) and the minimum
-    // blade-shape resolution (min_chord_dr / chord). The final station count is
-    // the integrated metric, so users specify resolution targets rather than a
-    // fixed number of radial stations.
+    // requested Gaussian resolution (epsilon_dr / epsilon_radial) and the
+    // minimum blade-shape resolution (min_chord_dr / chord). The final station
+    // count is the integrated metric, so users specify resolution targets
+    // rather than a fixed number of radial stations.
     for (int i = 1; i < dense_n; ++i) {
         const auto density_at = [&](const amrex::Real r) {
             const amrex::Real mu =
                 (r - meta.root_radius) / (meta.rotor_radius - meta.root_radius);
             const amrex::Real chord = ::kynema_sgf::interp::linear(
                 meta.span_locs, meta.chord_inp, mu);
-            const amrex::Real eps = local_epsilon(meta, chord);
+            const amrex::Real eps = local_epsilon(meta, chord).z();
             return amrex::max(meta.epsilon_dr / eps, meta.min_chord_dr / chord);
         };
         const amrex::Real d0 = density_at(dense_r[i - 1]);
@@ -271,7 +280,7 @@ void set_placement(
     meta.rotor_angular_velocity = vs::Vector::zero();
     meta.user_rotor_angular_velocity = true;
 
-    const amrex::Real max_eps = local_epsilon(meta, max_interp_chord(meta));
+    const amrex::Real max_eps = max_epsilon(meta);
     const amrex::Real search_radius =
         meta.rotor_radius + meta.support_radius_over_epsilon * max_eps;
     if ((meta.body_motion && meta.body_motion->moves()) ||
@@ -296,10 +305,10 @@ void build_gaussian_table(ActuatorSectorData& meta)
     }
     const amrex::Real xmax =
         meta.support_radius_over_epsilon * meta.support_radius_over_epsilon;
-    // The table stores exp(-x) for x = (r / epsilon)^2 over the compact support
-    // 0 <= x <= support_radius_over_epsilon^2.
-    // Linear interpolation error for exp(-x) is bounded by h^2 / 8 because
-    // max |d^2 exp(-x) / dx^2| = 1 on x >= 0.
+    // The table stores exp(-x) for squared distance in epsilon-scaled local
+    // coordinates. Its compact support is 0 <= x <=
+    // support_radius_over_epsilon^2. Linear interpolation error for exp(-x) is
+    // bounded by h^2 / 8 because max |d^2 exp(-x) / dx^2| = 1 on x >= 0.
     const amrex::Real max_table_spacing =
         std::sqrt(8.0_rt * meta.gaussian_table_error);
     meta.gaussian_table_nintervals =
@@ -324,7 +333,7 @@ ActuatorRefinementGeometry refinement_geometry(
     auto normal = orientation & vs::Vector::khat();
     normal /= vs::mag(normal);
 
-    const amrex::Real epsilon_max = local_epsilon(meta, max_interp_chord(meta));
+    const amrex::Real epsilon_max = max_epsilon(meta);
     return {label, center, normal, meta.rotor_radius, epsilon_max};
 }
 
@@ -359,7 +368,8 @@ void prepare_netcdf_group(
     grp.def_var("dr", NC_DOUBLE, {nr_name});
     grp.def_var("chord", NC_DOUBLE, {nr_name});
     grp.def_var("twist", NC_DOUBLE, {nr_name});
-    grp.def_var("epsilon", NC_DOUBLE, {nr_name});
+    grp.def_var("epsilon", NC_DOUBLE, {nr_name, "ndim"});
+    grp.var("epsilon").put_attr("components", "chord thickness radial");
     grp.def_var("theta_count", NC_INT, {nt_name, nr_name});
     grp.def_var("xyz", NC_DOUBLE, tbr_vec);
     grp.def_var("blade_force", NC_DOUBLE, tbr_vec);
@@ -394,7 +404,7 @@ void write_netcdf_group_metadata(
     grp.var("dr").put(meta.dr.data(), {0}, {nr});
     grp.var("chord").put(meta.chord.data(), {0}, {nr});
     grp.var("twist").put(meta.twist.data(), {0}, {nr});
-    grp.var("epsilon").put(meta.epsilon_profile.data(), {0}, {nr});
+    grp.var("epsilon").put(meta.epsilon_profile[0].data(), {0, 0}, {nr, 3});
 #else
     amrex::ignore_unused(parent, group_name, meta);
 #endif
@@ -572,11 +582,8 @@ void ReadInputsOp<ActuatorSector, ActSrcSector>::operator()(
     pp.queryarr("span_locs", meta.span_locs);
     pp.queryarr("chord", meta.chord_inp);
     pp.queryarr("twist", meta.twist_inp);
-    if (pp.contains("epsilon")) {
-        pp.get("epsilon", meta.epsilon);
-        meta.user_epsilon = true;
-    }
-    pp.query("epsilon_chord", meta.epsilon_chord);
+    pp.query_either("epsilon", meta.epsilon);
+    pp.query_either("epsilon_chord", meta.epsilon_chord);
     pp.query("epsilon_min", meta.epsilon_min);
     pp.query("epsilon_dr", meta.epsilon_dr);
     pp.query("epsilon_dl", meta.epsilon_dl);
@@ -598,20 +605,20 @@ void ReadInputsOp<ActuatorSector, ActSrcSector>::operator()(
             "ActuatorSector requires specification of one or both of "
             "'epsilon' or 'epsilon_chord'");
     }
-    if (pp.contains("epsilon") && pp.contains("epsilon_chord")) {
-        amrex::Print()
-            << "WARNING: ActuatorSector inputs 'epsilon' and 'epsilon_chord' "
-               "are both specified. Using constant 'epsilon'; "
-               "'epsilon_chord' and 'epsilon_min' will be ignored.\n";
-    }
     AMREX_ALWAYS_ASSERT(meta.num_blades > 0);
     AMREX_ALWAYS_ASSERT(meta.rotor_diameter > 0.0_rt);
-    AMREX_ALWAYS_ASSERT(meta.epsilon >= 0.0_rt);
-    AMREX_ALWAYS_ASSERT(meta.epsilon_chord >= 0.0_rt);
-    AMREX_ALWAYS_ASSERT(meta.epsilon_min >= 0.0_rt);
     AMREX_ALWAYS_ASSERT(
-        (meta.user_epsilon && (meta.epsilon > 0.0_rt)) ||
-        (!meta.user_epsilon && (meta.epsilon_chord > 0.0_rt)));
+        std::isfinite(meta.epsilon_min) && meta.epsilon_min >= 0.0_rt);
+    for (int n = 0; n < AMREX_SPACEDIM; ++n) {
+        AMREX_ALWAYS_ASSERT(
+            std::isfinite(meta.epsilon[n]) && meta.epsilon[n] >= 0.0_rt);
+        AMREX_ALWAYS_ASSERT(
+            std::isfinite(meta.epsilon_chord[n]) &&
+            meta.epsilon_chord[n] >= 0.0_rt);
+        AMREX_ALWAYS_ASSERT(
+            meta.epsilon[n] > 0.0_rt || meta.epsilon_chord[n] > 0.0_rt ||
+            meta.epsilon_min > 0.0_rt);
+    }
     AMREX_ALWAYS_ASSERT(meta.root_radius_fraction >= 0.0_rt);
     AMREX_ALWAYS_ASSERT(meta.root_radius_fraction < 1.0_rt);
     AMREX_ALWAYS_ASSERT(meta.span_locs.size() == meta.chord_inp.size());
@@ -643,8 +650,7 @@ void ReadInputsOp<ActuatorSector, ActSrcSector>::operator()(
         meta.rotor_motion->read_sector_inputs(pp, meta.omega, meta.user_omega);
     }
 
-    const amrex::Real max_eps =
-        sector::local_epsilon(meta, sector::max_interp_chord(meta));
+    const amrex::Real max_eps = sector::max_epsilon(meta);
     const amrex::Real search_radius =
         meta.rotor_radius + meta.support_radius_over_epsilon * max_eps;
     const auto& geom = data.sim().mesh().Geom(0);
@@ -786,16 +792,13 @@ void ComputeForceOp<ActuatorSector, ActSrcSector>::operator()(
             const amrex::Real vnormal = rel_wind & e_normal;
             const auto vplane = e_theta * vtheta + e_normal * vnormal;
             const amrex::Real vmag = vs::mag(vplane);
-            // AoA is measured in the local tangential-normal blade plane using
-            // a rotation-aware tangential direction. This keeps a mirrored
-            // propeller (negative omega and negative twist) aerodynamically
-            // equivalent to the positive-rotation propeller, while preserving
-            // opposite tangential force for torque cancellation.
-            const amrex::Real raw_aoa =
-                std::atan2(vnormal, -spin_sign * vtheta) +
-                spin_sign * ::kynema_sgf::utils::radians(meta.twist[ir]);
-            const amrex::Real aoa =
-                std::remainder(raw_aoa, ::kynema_sgf::utils::two_pi());
+            // The sector basis satisfies e_r x e_theta = -e_normal.
+            // Positive pitch lifts the blade toward -e_normal, so induced
+            // flow toward +e_normal reduces incidence: alpha = beta - phi.
+            // Reversing both omega and twist preserves effective pitch beta.
+            const amrex::Real aoa = sector::section_angle_of_attack(
+                vtheta, vnormal,
+                ::kynema_sgf::utils::radians(meta.twist[ir]), meta.omega);
 
             amrex::Real cl = 0.0_rt;
             amrex::Real cd = 0.0_rt;
@@ -840,7 +843,9 @@ void ComputeForceOp<ActuatorSector, ActSrcSector>::operator()(
         const int ntheta = amrex::max(
             1, static_cast<int>(std::ceil(
                    swept_speed * dt * meta.epsilon_dl /
-                   meta.epsilon_profile[ir])));
+                   amrex::min(
+                       meta.epsilon_profile[ir].x(),
+                       meta.epsilon_profile[ir].y()))));
         meta.theta_counts[ir] = ntheta;
         nforce += meta.num_blades * ntheta;
     }
@@ -883,7 +888,15 @@ void ComputeForceOp<ActuatorSector, ActSrcSector>::operator()(
                 meta.integrated_moment =
                     meta.integrated_moment +
                     ((grid.pos[iq] - rotor_center) ^ grid.force[iq]);
-                grid.epsilon[iq] = vs::Vector::one() * meta.epsilon_profile[ir];
+                grid.epsilon[iq] = meta.epsilon_profile[ir];
+                const auto twist = ::kynema_sgf::utils::radians(meta.twist[ir]);
+                const auto axes = sector::section_axis_coefficients(twist);
+                const auto e_chord =
+                    axes.chord_theta * e_theta + axes.chord_normal * e_normal;
+                const auto e_thickness =
+                    axes.thickness_theta * e_theta +
+                    axes.thickness_normal * e_normal;
+                grid.orientation[iq] = vs::Tensor(e_chord, e_thickness, e_r);
                 ++iq;
             }
         }
@@ -926,6 +939,7 @@ void ActSrcOp<ActuatorSector, ActSrcSector>::copy_to_device()
         m_pos.resize(npts);
         m_force.resize(npts);
         m_epsilon.resize(npts);
+        m_orientation.resize(npts);
     }
     amrex::Gpu::copy(
         amrex::Gpu::hostToDevice, grid.pos.begin(), grid.pos.end(),
@@ -936,6 +950,9 @@ void ActSrcOp<ActuatorSector, ActSrcSector>::copy_to_device()
     amrex::Gpu::copy(
         amrex::Gpu::hostToDevice, grid.epsilon.begin(), grid.epsilon.end(),
         m_epsilon.begin());
+    amrex::Gpu::copy(
+        amrex::Gpu::hostToDevice, grid.orientation.begin(),
+        grid.orientation.end(), m_orientation.begin());
     const auto& table = m_data.meta().gaussian_table;
     if (static_cast<int>(m_gaussian_table.size()) !=
         static_cast<int>(table.size())) {
@@ -966,6 +983,7 @@ void ActSrcOp<ActuatorSector, ActSrcSector>::operator()(
     const auto* pos = m_pos.data();
     const auto* force = m_force.data();
     const auto* eps = m_epsilon.data();
+    const auto* orientation = m_orientation.data();
 
     const auto& meta = m_data.meta();
     const amrex::Real support2 =
@@ -983,7 +1001,7 @@ void ActSrcOp<ActuatorSector, ActSrcSector>::operator()(
 
         amrex::RealArray src_force = {0.0_rt};
         for (int ip = 0; ip < npts; ++ip) {
-            const auto dist = cc - pos[ip];
+            const auto dist = orientation[ip] & (cc - pos[ip]);
             const vs::Vector rr{
                 dist.x() / eps[ip].x(), dist.y() / eps[ip].y(),
                 dist.z() / eps[ip].z()};
@@ -994,8 +1012,9 @@ void ActSrcOp<ActuatorSector, ActSrcSector>::operator()(
 
             amrex::Real eval = 0.0_rt;
             if (use_table) {
-                // rr_sqr already equals x = (r / epsilon)^2. The table is
-                // uniform in x over [0, support_radius_over_epsilon^2].
+                // rr_sqr is squared distance in epsilon-scaled local
+                // coordinates. The table is uniform in x over [0,
+                // support_radius_over_epsilon^2].
                 const amrex::Real scaled =
                     rr_sqr / support2 *
                     static_cast<amrex::Real>(table_nintervals);

@@ -284,7 +284,7 @@ TEST_F(ActuatorSectorTest, fixed_epsilon_input)
 
     const auto& meta = sector.meta();
     for (const auto eps : meta.epsilon_profile) {
-        EXPECT_NEAR(eps, 0.004_rt, 1.0e-14_rt);
+        for (int n = 0; n < 3; ++n) EXPECT_NEAR(eps[n], 0.004_rt, 1.0e-14_rt);
     }
 
     remove_file(m_afname);
@@ -311,9 +311,104 @@ TEST_F(ActuatorSectorTest, epsilon_chord_uses_minimum)
     for (int i = 0; i < static_cast<int>(meta.epsilon_profile.size()); ++i) {
         const amrex::Real expected =
             amrex::max(0.004_rt, 0.25_rt * meta.chord[i]);
-        EXPECT_NEAR(meta.epsilon_profile[i], expected, 1.0e-14_rt);
+        for (int n = 0; n < 3; ++n)
+            EXPECT_NEAR(meta.epsilon_profile[i][n], expected, 1.0e-14_rt);
     }
 
+    remove_file(m_afname);
+}
+
+TEST_F(ActuatorSectorTest, directional_epsilon_follows_blade)
+{
+    namespace act = kynema_sgf::actuator;
+    using kynema_sgf::vs::Vector;
+    write_airfoil_file(m_afname);
+    initialize_domain();
+    populate_actuator_inputs();
+    amrex::ParmParse pp("Actuator.R1");
+    pp.addarr("epsilon", act::RealList{0.025, 0.035, 0.045});
+    pp.addarr("epsilon_chord", act::RealList{4, 0, 0});
+    pp.addarr("rotor_normal", act::RealList{1, 2, 3});
+    pp.addarr("translation_velocity", act::RealList{0, 0, 0});
+    pp.add("support_radius_over_epsilon", 5.0);
+    auto& field = sim().repo().get_field("actuator_src_term");
+    auto& moments = sim().repo().declare_field("kernel_moments", 3, 0);
+    const auto& geom = sim().mesh().Geom(0);
+    const auto dx = geom.CellSizeArray();
+    const auto lo = geom.ProbLoArray();
+    const auto dv = dx[0] * dx[1] * dx[2];
+    for (int sign : {-1, 1}) {
+        pp.add("omega", sign * 2500.0);
+        pp.addarr("twist", act::RealList{sign * 30.0, sign * 30.0});
+        pp.add("gaussian_type", std::string(sign < 0 ? "direct" : "table"));
+        act::ActuatorSector::DataType data(sim(), "R1", 0);
+        act::ops::ReadInputsOp<act::ActuatorSector, act::ActSrcSector>()(
+            data,
+            act::utils::ActParser("Actuator.ActuatorSector", "Actuator.R1"));
+        act::ops::InitDataOp<act::ActuatorSector, act::ActSrcSector>()(data);
+        act::ops::ComputeForceOp<act::ActuatorSector, act::ActSrcSector>()(
+            data);
+        auto& grid = data.grid();
+        const auto& meta = data.meta();
+        for (int i = 0; i < static_cast<int>(grid.pos.size()); ++i) {
+            const auto radial = (grid.pos[i] - meta.center).unit();
+            const auto normal = meta.rotor_normal.unit();
+            const auto tangent = radial ^ normal;
+            const auto chord = std::sqrt(0.75) * tangent - sign * 0.5 * normal;
+            const auto thickness =
+                sign * 0.5 * tangent + std::sqrt(0.75) * normal;
+            for (int n = 0; n < 3; ++n) {
+                EXPECT_NEAR(
+                    (grid.orientation[i] & chord)[n], n == 0 ? 1 : 0, 1e-12);
+                EXPECT_NEAR(
+                    (grid.orientation[i] & thickness)[n], n == 1 ? 1 : 0,
+                    1e-12);
+                EXPECT_NEAR(
+                    (grid.orientation[i] & radial)[n], n == 2 ? 1 : 0, 1e-12);
+            }
+        }
+        const auto eps = grid.epsilon.front();
+        EXPECT_NEAR(eps.x(), std::max(0.025, 4 * meta.chord.front()), 1e-12);
+        EXPECT_NEAR(eps.y(), 0.035, 1e-12);
+        EXPECT_NEAR(eps.z(), 0.045, 1e-12);
+        // Isolate one rotated kernel: verify its integral and directional
+        // variance.
+        const auto orientation = grid.orientation.front();
+        grid.pos.assign(1, Vector::zero());
+        grid.force.assign(1, Vector{0, 0, 1});
+        grid.epsilon.resize(1);
+        grid.orientation.resize(1);
+        act::ops::ActSrcOp<act::ActuatorSector, act::ActSrcSector> source(data);
+        source.initialize();
+        field.setVal(0);
+        for (amrex::MFIter mfi(field(0)); mfi.isValid(); ++mfi) {
+            source(0, mfi, geom);
+            const auto f = field(0).const_array(mfi);
+            const auto moment = moments(0).array(mfi);
+            amrex::ParallelFor(
+                mfi.validbox(), [=] AMREX_GPU_DEVICE(int i, int j, int k) {
+                    const auto local =
+                        orientation & Vector{
+                                          lo[0] + (i + 0.5) * dx[0],
+                                          lo[1] + (j + 0.5) * dx[1],
+                                          lo[2] + (k + 0.5) * dx[2]};
+                    for (int n = 0; n < 3; ++n)
+                        moment(i, j, k, n) =
+                            f(i, j, k, 2) * local[n] * local[n];
+                });
+        }
+        EXPECT_NEAR(field(0).sum(2) * dv, 1, 2e-4);
+        for (int n = 0; n < 3; ++n)
+            EXPECT_NEAR(
+                moments(0).sum(n) * dv, 0.5 * eps[n] * eps[n],
+                2e-4 * eps[n] * eps[n]);
+        // Radial smoothing must not change the swept-point count.
+        const auto counts = meta.theta_counts;
+        for (auto& width : data.meta().epsilon_profile) width.z() = 1e-4;
+        act::ops::ComputeForceOp<act::ActuatorSector, act::ActSrcSector>()(
+            data);
+        EXPECT_EQ(meta.theta_counts, counts);
+    }
     remove_file(m_afname);
 }
 

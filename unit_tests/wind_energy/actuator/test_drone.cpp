@@ -695,9 +695,11 @@ TEST_F(DroneActuatorTest, matches_equivalent_standalone_sectors)
             EXPECT_NEAR(drone_meta.dr[j], sector_meta.dr[j], tol);
             EXPECT_NEAR(drone_meta.chord[j], sector_meta.chord[j], tol);
             EXPECT_NEAR(drone_meta.twist[j], sector_meta.twist[j], tol);
-            EXPECT_NEAR(
-                drone_meta.epsilon_profile[j], sector_meta.epsilon_profile[j],
-                tol);
+            for (int n = 0; n < 3; ++n) {
+                EXPECT_NEAR(
+                    drone_meta.epsilon_profile[j][n],
+                    sector_meta.epsilon_profile[j][n], tol);
+            }
         }
 
         EXPECT_EQ(drone_grid.pos.size(), sector_grid.pos.size());
