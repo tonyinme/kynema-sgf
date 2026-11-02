@@ -149,12 +149,12 @@ void ModulatedPowerLaw::set_velocity(
     const amrex::Real num2 = vmax * (height - z2);
     const amrex::Real denom =
         0.5_rt *
-        (std::log(std::cosh(-smear_coeff * (height - zc))) / smear_coeff -
-         std::log(std::cosh(-smear_coeff * (z2 - zc))) / smear_coeff +
+        ((std::log(std::cosh(-smear_coeff * (height - zc))) / smear_coeff) -
+         (std::log(std::cosh(-smear_coeff * (z2 - zc))) / smear_coeff) +
          (height - z2));
 
     const amrex::Real upper_coeff =
-        (bulk_velocity * height - num1 - num2) / denom;
+        ((bulk_velocity * height) - num1 - num2) / denom;
 
     const auto& bctype = fld.bc_type();
     const int nghost = 1;
@@ -205,7 +205,10 @@ void ModulatedPowerLaw::set_velocity(
                     arr(i, j, k, dcomp + n) = vels[orig_comp + n];
                 }
             });
+            utils::extend_boundary_ghost_layers(bx, arr, ori, dcomp, numcomp);
         }
+        utils::fill_transverse_ghosts(
+            mfab, geom, fld.bcrec(), ori, dcomp, mfab.nComp(), orig_comp);
     }
 }
 
@@ -281,7 +284,9 @@ void ModulatedPowerLaw::set_temperature(
                                                       theta_gauss_var, engine);
                     }
                 });
+            utils::extend_boundary_ghost_layers(bx, arr, ori, 0, 1);
         }
+        utils::fill_transverse_ghosts(mfab, geom, fld.bcrec(), ori, 0, 1);
     }
 }
 

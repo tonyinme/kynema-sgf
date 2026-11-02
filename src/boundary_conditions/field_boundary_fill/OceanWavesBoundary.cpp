@@ -127,7 +127,7 @@ void OceanWavesBoundary::set_velocity(
             amrex::ParallelFor(bx, [=] AMREX_GPU_DEVICE(int i, int j, int k) {
                 const amrex::IntVect iv{i, j, k};
                 for (int n = 0; n < numcomp; n++) {
-                    if (targ_vof(iv) > constants::TIGHT_TOL) {
+                    if (targ_vof(iv) > constants::VOF_TOL) {
                         arr(iv, dcomp + n) = targ_arr(iv, orig_comp + n);
                     }
                     if (terrain_and_vof_exist) {
@@ -139,7 +139,10 @@ void OceanWavesBoundary::set_velocity(
                     }
                 }
             });
+            utils::extend_boundary_ghost_layers(bx, arr, ori, dcomp, numcomp);
         }
+        utils::fill_transverse_ghosts(
+            mfab, geom, fld.bcrec(), ori, dcomp, mfab.nComp(), orig_comp);
     }
 }
 
@@ -182,7 +185,9 @@ void OceanWavesBoundary::set_vof(
             amrex::ParallelFor(bx, [=] AMREX_GPU_DEVICE(int i, int j, int k) {
                 arr(i, j, k) = targ_arr(i, j, k);
             });
+            utils::extend_boundary_ghost_layers(bx, arr, ori, 0, 1);
         }
+        utils::fill_transverse_ghosts(mfab, geom, fld.bcrec(), ori, 0, 1);
     }
 }
 
@@ -233,7 +238,9 @@ void OceanWavesBoundary::set_density(
                 arr(i, j, k) = (targ_vof(i, j, k) * rho1) +
                                ((1.0_rt - targ_vof(i, j, k)) * arr(i, j, k));
             });
+            utils::extend_boundary_ghost_layers(bx, arr, ori, 0, 1);
         }
+        utils::fill_transverse_ghosts(mfab, geom, fld.bcrec(), ori, 0, 1);
     }
 }
 
@@ -304,7 +311,7 @@ void OceanWavesBoundary::set_inflow_sibling_velocity(
                         amrex::IntVect cc_iv = {i, j, k};
                         cc_iv += shift_to_cc;
 
-                        if (targ_vof(cc_iv) > constants::TIGHT_TOL) {
+                        if (targ_vof(cc_iv) > constants::VOF_TOL) {
                             marr(i, j, k, 0) = targ_arr(cc_iv, fdir);
                         }
                         if (terrain_and_vof_exist) {
