@@ -1,5 +1,4 @@
 #include "src/wind_energy/actuator/sector/actuator_sector_ops.H"
-#include "src/wind_energy/actuator/sector/section_aerodynamics.H"
 
 #include "src/CFDSim.H"
 #include "src/core/Field.H"
@@ -870,6 +869,9 @@ void ComputeForceOp<ActuatorSector, ActSrcSector>::operator()(
         for (int ir = 0; ir < nr; ++ir) {
             const int ip = (ib * nr) + ir;
             const int ntheta = meta.theta_counts[ir];
+            const auto twist = ::kynema_sgf::utils::radians(meta.twist[ir]);
+            const auto cosine = std::cos(twist);
+            const auto sine = std::sin(twist);
             for (int it = 0; it < ntheta; ++it) {
                 const amrex::Real xi = (static_cast<amrex::Real>(it) + 0.5_rt) /
                                        static_cast<amrex::Real>(ntheta);
@@ -897,14 +899,10 @@ void ComputeForceOp<ActuatorSector, ActSrcSector>::operator()(
                     meta.integrated_moment +
                     ((grid.pos[iq] - rotor_center) ^ grid.force[iq]);
                 grid.epsilon[iq] = meta.epsilon_profile[ir];
-                const auto twist = ::kynema_sgf::utils::radians(meta.twist[ir]);
-                const auto axes = sector::section_axis_coefficients(twist);
-                const auto e_chord =
-                    axes.chord_theta * e_theta + axes.chord_normal * e_normal;
-                const auto e_thickness =
-                    axes.thickness_theta * e_theta +
-                    axes.thickness_normal * e_normal;
-                grid.orientation[iq] = vs::Tensor(e_chord, e_thickness, e_r);
+                // Local Gaussian directions: chord, thickness, radial.
+                grid.orientation[iq] = vs::Tensor(
+                    cosine * e_theta - sine * e_normal,
+                    sine * e_theta + cosine * e_normal, e_r);
                 ++iq;
             }
         }

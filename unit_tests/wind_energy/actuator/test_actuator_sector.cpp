@@ -9,6 +9,7 @@
 #include "src/utilities/constants.H"
 #include "src/utilities/tagging/ActuatorRefinement.H"
 
+#include <cmath>
 #include <fstream>
 #include <limits>
 
@@ -408,6 +409,61 @@ TEST_F(ActuatorSectorTest, directional_epsilon_follows_blade)
         act::ops::ComputeForceOp<act::ActuatorSector, act::ActSrcSector>()(
             data);
         EXPECT_EQ(meta.theta_counts, counts);
+    }
+    remove_file(m_afname);
+}
+
+TEST_F(ActuatorSectorTest, incidence_and_mirrored_loads)
+{
+    namespace act = kynema_sgf::actuator;
+    write_airfoil_file(m_afname);
+    initialize_domain();
+    populate_actuator_inputs(true, 0.006_rt, false);
+    amrex::ParmParse pp("Actuator.R1");
+    pp.addarr("translation_velocity", act::RealList{0, 0, 0});
+    pp.addarr("rotor_normal", act::RealList{0, 0, 1});
+    const auto radians = std::acos(-1.0_rt) / 180;
+    const auto tol = sizeof(amrex::Real) == sizeof(double) ? 1e-10 : 1e-3;
+    const act::RealList inflow{0, 0.3_rt, -0.3_rt, 0};
+    act::RealList thrust(4), torque(4);
+    for (int spin : {1, -1}) {
+        pp.add("omega", spin * 200.0_rt);
+        pp.addarr("twist", act::RealList{spin * 20.0_rt, spin * 20.0_rt});
+        act::ActuatorSector::DataType data(sim(), "R1", 0);
+        act::ops::ReadInputsOp<act::ActuatorSector, act::ActSrcSector>()(
+            data,
+            act::utils::ActParser("Actuator.ActuatorSector", "Actuator.R1"));
+        act::ops::InitDataOp<act::ActuatorSector, act::ActSrcSector>()(data);
+        auto& grid = data.grid();
+        const auto& m = data.meta();
+        for (int flow = 0; flow < 4; ++flow) {
+            for (int i = 0; i < static_cast<int>(grid.vel.size()); ++i) {
+                const auto speed = 200 * m.radius[i % m.radius.size()];
+                // Fourth flow is aligned with the physical blade chord.
+                const auto w =
+                    flow == 3 ? speed * std::tan(20 * radians) : inflow[flow];
+                grid.vel[i] = {0, 0, w};
+            }
+            act::ops::ComputeForceOp<act::ActuatorSector, act::ActSrcSector>()(
+                data);
+            for (int i = 0; i < static_cast<int>(m.aoa.size()); ++i) {
+                const auto speed = 200 * m.radius[i % m.radius.size()];
+                const auto alpha =
+                    flow == 3 ? 0
+                              : 20 - std::atan2(inflow[flow], speed) / radians;
+                EXPECT_NEAR(m.aoa[i], alpha, tol);
+                if (flow == 3) EXPECT_NEAR(m.cl[i], 0, tol);
+            }
+            EXPECT_NEAR(m.integrated_force.z(), m.thrust, tol);
+            EXPECT_NEAR(m.integrated_moment.z(), -m.torque, tol);
+            if (spin == 1) {
+                thrust[flow] = m.thrust;
+                torque[flow] = m.torque;
+            } else {
+                EXPECT_NEAR(m.thrust, thrust[flow], tol);
+                EXPECT_NEAR(m.torque, -torque[flow], tol);
+            }
+        }
     }
     remove_file(m_afname);
 }

@@ -165,8 +165,7 @@ void read_structure(Drone::DataType& data, const utils::ActParser& pp)
         const auto chord = (span ^ vs::Vector::khat()).unit();
         AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
             vs::mag(chord) > 0, "Vertical reference arms are not supported");
-        vs::Tensor frame;
-        frame.cols(chord, span, chord ^ span);
+        const vs::Tensor frame(chord, span, chord ^ span, true);
         section.addarr("start", RealList{0, 0, 0});
         section.addarr("end", RealList{0, length, 0});
         ReadInputsOp<FixedWing, ActSrcLine>()(*wing, wing_pp);
@@ -449,8 +448,7 @@ void InitDataOp<Drone, ActSrcDrone>::operator()(Drone::DataType& data)
     }
     const int n = meta.body_points.size();
     data.grid().resize(n, total_points + n);
-    data.grid().epsilon.assign(
-        n, vs::Vector{meta.box_epsilon, meta.box_epsilon, meta.box_epsilon});
+    data.grid().epsilon.assign(n, vs::Vector::one() * meta.box_epsilon);
     data.grid().orientation.assign(n, vs::Tensor::identity());
     int offset = meta.box_points;
     for (const auto& arm : meta.arms) {
@@ -522,20 +520,21 @@ void ComputeForceOp<Drone, ActSrcDrone>::operator()(Drone::DataType& data)
         meta.body_motion->translation_velocity(midpoint_time);
     const auto omega = meta.body_motion->angular_velocity(midpoint_time);
     const int offset = grid.vel.size() - grid.pos.size();
-    VecList relative(grid.pos.size());
-    for (int i = 0; i < static_cast<int>(grid.pos.size()); ++i) {
-        relative[i] = grid.vel[offset + i] - translation -
-                      (omega ^ (grid.pos[i] - drone_center));
-        if (i < meta.box_points)
-            grid.force[i] = -0.5_rt * meta.box_drag_area *
-                            vs::mag(relative[i]) * relative[i];
+    const auto relative_velocity = [&](int i) {
+        return grid.vel[offset + i] - translation -
+               (omega ^ (grid.pos[i] - drone_center));
+    };
+    for (int i = 0; i < meta.box_points; ++i) {
+        const auto velocity = relative_velocity(i);
+        grid.force[i] =
+            -0.5_rt * meta.box_drag_area * vs::mag(velocity) * velocity;
     }
     int point = meta.box_points;
     for (int a = 0; a < static_cast<int>(meta.arms.size()); ++a) {
         auto& arm = *meta.arms[a];
         const auto frame = rotation & meta.arm_frames[a];
         for (int i = 0; i < arm.meta().num_pts; ++i)
-            arm.grid().vel[i] = relative[point + i] & frame;
+            arm.grid().vel[i] = relative_velocity(point + i) & frame;
         UpdateVelOp<FixedWing, ActSrcLine>()(arm);
         ComputeForceOp<FixedWing, ActSrcLine>()(arm);
         for (int i = 0; i < arm.meta().num_pts; ++i, ++point) {
