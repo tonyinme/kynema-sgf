@@ -181,6 +181,8 @@ TEST_F(ActuatorSectorTest, act_model_init)
     sector.init_actuator_source();
 
     const auto& meta = sector.meta();
+    EXPECT_FALSE(meta.fllc);
+    EXPECT_TRUE(meta.fllc_blades.empty());
     EXPECT_GT(meta.radius.size(), 0);
     EXPECT_EQ(meta.radius.size(), meta.dr.size());
     EXPECT_EQ(meta.gaussian_table_nintervals, 319);
@@ -355,9 +357,9 @@ TEST_F(ActuatorSectorTest, directional_epsilon_follows_blade)
             const auto radial = (grid.pos[i] - meta.center).unit();
             const auto normal = meta.rotor_normal.unit();
             const auto tangent = radial ^ normal;
-            const auto chord = std::sqrt(0.75) * tangent - sign * 0.5 * normal;
+            const auto chord = std::sqrt(0.75) * tangent + sign * 0.5 * normal;
             const auto thickness =
-                sign * 0.5 * tangent + std::sqrt(0.75) * normal;
+                -sign * 0.5 * tangent + std::sqrt(0.75) * normal;
             for (int n = 0; n < 3; ++n) {
                 EXPECT_NEAR(
                     (grid.orientation[i] & chord)[n], n == 0 ? 1 : 0, 1e-12);
@@ -441,7 +443,7 @@ TEST_F(ActuatorSectorTest, incidence_and_mirrored_loads)
                 const auto speed = 200 * m.radius[i % m.radius.size()];
                 // Fourth flow is aligned with the physical blade chord.
                 const auto w =
-                    flow == 3 ? speed * std::tan(20 * radians) : inflow[flow];
+                    flow == 3 ? -speed * std::tan(20 * radians) : inflow[flow];
                 grid.vel[i] = {0, 0, w};
             }
             act::ops::ComputeForceOp<act::ActuatorSector, act::ActSrcSector>()(
@@ -450,10 +452,18 @@ TEST_F(ActuatorSectorTest, incidence_and_mirrored_loads)
                 const auto speed = 200 * m.radius[i % m.radius.size()];
                 const auto alpha =
                     flow == 3 ? 0
-                              : 20 - std::atan2(inflow[flow], speed) / radians;
+                              : 20 + std::atan2(inflow[flow], speed) / radians;
                 EXPECT_NEAR(m.aoa[i], alpha, tol);
                 if (flow == 3) EXPECT_NEAR(m.cl[i], 0, tol);
+                EXPECT_LE(
+                    m.blade_force_theta[i] * m.vel_rel[i].x() +
+                        m.blade_force_normal[i] * m.vel_rel[i].y(),
+                    tol);
             }
+            // Upright positive-pitch rotors push fluid down and lift the
+            // vehicle.
+            if (flow != 3) EXPECT_LT(m.integrated_force.z(), 0);
+            if (flow == 0) EXPECT_GT(spin * m.torque, 0);
             EXPECT_NEAR(m.integrated_force.z(), m.thrust, tol);
             EXPECT_NEAR(m.integrated_moment.z(), -m.torque, tol);
             if (spin == 1) {
@@ -465,6 +475,91 @@ TEST_F(ActuatorSectorTest, incidence_and_mirrored_loads)
             }
         }
     }
+    remove_file(m_afname);
+}
+
+TEST_F(ActuatorSectorTest, fllc_activation_and_independent_blades)
+{
+    namespace act = kynema_sgf::actuator;
+    write_airfoil_file(m_afname);
+    initialize_domain();
+    populate_actuator_inputs(true, 0.006_rt, false);
+    amrex::ParmParse pp("Actuator.R1");
+    pp.addarr("translation_velocity", act::RealList{0, 0, 0});
+    pp.addarr("rotor_normal", act::RealList{0, 0, 1});
+    pp.add("fllc", true);
+    pp.add("fllc_start_time", 0.2_rt);
+    pp.add("fllc_epsilon_chord", 0.25_rt);
+    for (int spin : {1, -1}) {
+        pp.add("omega", spin * 200.0_rt);
+        pp.addarr("twist", act::RealList{spin * 20.0_rt, spin * 20.0_rt});
+        act::ActuatorSector::DataType data(sim(), "R1", 0);
+        act::ops::ReadInputsOp<act::ActuatorSector, act::ActSrcSector>()(
+            data,
+            act::utils::ActParser("Actuator.ActuatorSector", "Actuator.R1"));
+        act::ops::InitDataOp<act::ActuatorSector, act::ActSrcSector>()(data);
+        auto& m = data.meta();
+        ASSERT_EQ(m.fllc_blades.size(), 2U);
+        for (auto& v : data.grid().vel) v = {0, 0, -0.3_rt};
+        sim().time().current_time() = 0.1_rt;
+        act::ops::ComputeForceOp<act::ActuatorSector, act::ActSrcSector>()(
+            data);
+        for (const auto& v : m.fllc_velocity_correction)
+            EXPECT_DOUBLE_EQ(kynema_sgf::vs::mag(v), 0);
+        for (const auto& b : m.fllc_blades) EXPECT_FALSE(b.have_loads);
+        sim().time().current_time() = 0.21_rt;
+        act::ops::ComputeForceOp<act::ActuatorSector, act::ActSrcSector>()(
+            data);
+        for (const auto& v : m.fllc_velocity_correction)
+            EXPECT_DOUBLE_EQ(kynema_sgf::vs::mag(v), 0);
+        for (const auto& b : m.fllc_blades) EXPECT_TRUE(b.have_loads);
+        sim().time().current_time() += 0.0001_rt;
+        act::ops::ComputeForceOp<act::ActuatorSector, act::ActSrcSector>()(
+            data);
+        amrex::Real max_correction = 0;
+        for (const auto& v : m.fllc_velocity_correction) {
+            EXPECT_TRUE(std::isfinite(kynema_sgf::vs::mag(v)));
+            max_correction = std::max(max_correction, kynema_sgf::vs::mag(v));
+        }
+        EXPECT_GT(max_correction, 0);
+        EXPECT_LT(m.integrated_force.z(), 0);
+        EXPECT_GT(spin * m.torque, 0);
+    }
+    remove_file(m_afname);
+}
+
+TEST_F(ActuatorSectorTest, fllc_receives_actual_chord_and_floor_widths)
+{
+    namespace act = ::kynema_sgf::actuator;
+    write_airfoil_file(m_afname);
+    initialize_domain();
+    populate_actuator_inputs(false, 0.0_rt, true, 0.25_rt, 0.0015_rt);
+    amrex::ParmParse pp("Actuator.R1");
+    pp.addarr("chord", act::RealList{0.008_rt, 0.004_rt});
+    pp.addarr("translation_velocity", act::RealList{0, 0, 0});
+    pp.addarr("rotor_normal", act::RealList{0, 0, 1});
+    pp.add("fllc", true);
+    pp.add("fllc_start_time", 0.2_rt);
+    pp.add("fllc_epsilon_chord", 0.25_rt);
+    act::ActuatorSector::DataType data(sim(), "R1", 0);
+    act::ops::ReadInputsOp<act::ActuatorSector, act::ActSrcSector>()(
+        data, act::utils::ActParser("Actuator.ActuatorSector", "Actuator.R1"));
+    act::ops::InitDataOp<act::ActuatorSector, act::ActSrcSector>()(data);
+    const auto& m = data.meta();
+    bool floored = false;
+    bool chord_set = false;
+    for (const auto& blade : m.fllc_blades) {
+        ASSERT_EQ(blade.applied_epsilon.size(), m.chord.size());
+        for (amrex::Long i = 0; i < m.chord.size(); ++i) {
+            const auto expected = std::max(0.0015_rt, 0.25_rt * m.chord[i]);
+            EXPECT_DOUBLE_EQ(blade.applied_epsilon[i], expected);
+            EXPECT_DOUBLE_EQ(blade.applied_epsilon[i], m.epsilon_profile[i].x());
+            floored = floored || 0.25_rt * m.chord[i] < 0.0015_rt;
+            chord_set = chord_set || 0.25_rt * m.chord[i] > 0.0015_rt;
+        }
+    }
+    EXPECT_TRUE(floored);
+    EXPECT_TRUE(chord_set);
     remove_file(m_afname);
 }
 

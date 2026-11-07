@@ -5,6 +5,7 @@
 #include "src/core/gpu_utils.H"
 #include "src/utilities/constants.H"
 #include "src/utilities/io_utils.H"
+#include "src/utilities/IOManager.H"
 #include "src/utilities/linear_interpolation.H"
 #include "src/utilities/ncutils/nc_interface.H"
 #include "src/utilities/trig_ops.H"
@@ -355,6 +356,10 @@ void prepare_netcdf_group(
     const std::vector<std::string> tbr_vec{nt_name, nb_name, nr_name, "ndim"};
 
     auto grp = parent.def_group(group_name);
+    grp.put_attr("aerodynamic_convention", "upright_v1");
+    grp.put_attr(
+        "force_convention",
+        "rotor loads act on fluid; Drone force acts on vehicle");
     grp.put_attr("force_units", "kinematic force per span: m^3 s^-2");
     grp.put_attr("section_force_units", "kinematic force: m^4 s^-2");
     grp.put_attr(
@@ -368,7 +373,15 @@ void prepare_netcdf_group(
     grp.def_var("time", NC_DOUBLE, {nt_name});
     grp.def_var("time_index", NC_INT, {nt_name});
     grp.def_var("thrust", NC_DOUBLE, {nt_name});
+    grp.var("thrust").put_attr(
+        "description",
+        "kinematic fluid force along rotor normal; vehicle reaction has "
+        "opposite sign");
     grp.def_var("torque", NC_DOUBLE, {nt_name});
+    grp.var("torque").put_attr(
+        "description",
+        "negative fluid moment along rotor normal; resisting shaft torque = "
+        "density * sign(omega) * torque");
     grp.def_var("radius", NC_DOUBLE, {nr_name});
     grp.def_var("dr", NC_DOUBLE, {nr_name});
     grp.def_var("chord", NC_DOUBLE, {nr_name});
@@ -392,6 +405,23 @@ void prepare_netcdf_group(
         .put_attr("description", "relative velocity along rotor normal");
     grp.var("vel_rel_theta").put_attr("units", "m s^-1");
     grp.var("vel_rel_normal").put_attr("units", "m s^-1");
+    if (meta.fllc) {
+        grp.put_attr("experimental_fllc", "blade-local wing variable_chord");
+        grp.put_attr("fllc_applied_epsilon_mode", "isotropic_source_station");
+        grp.put_attr(
+            "fllc_epsilon_chord",
+            std::vector<amrex::Real>{meta.fllc_epsilon_chord});
+        grp.put_attr(
+            "fllc_relaxation_factor",
+            std::vector<amrex::Real>{meta.fllc_relaxation_factor});
+        grp.put_attr(
+            "fllc_start_time", std::vector<amrex::Real>{meta.fllc_start_time});
+        grp.def_var("fllc_velocity_correction", NC_DOUBLE, tbr_vec);
+        grp.var("fllc_velocity_correction").put_attr("units", "m s^-1");
+        grp.var("fllc_velocity_correction")
+            .put_attr(
+                "components", "theta normal radial; co-rotating section frame");
+    }
 #else
     amrex::ignore_unused(parent, group_name, meta);
 #endif
@@ -493,6 +523,12 @@ void write_netcdf_group(
     grp.var("aoa").put(meta.aoa.data(), {nt, 0, 0}, {1, nb, nr});
     grp.var("cl").put(meta.cl.data(), {nt, 0, 0}, {1, nb, nr});
     grp.var("cd").put(meta.cd.data(), {nt, 0, 0}, {1, nb, nr});
+    if (meta.fllc) {
+        grp.var("fllc_velocity_correction")
+            .put(
+                meta.fllc_velocity_correction[0].data(), {nt, 0, 0, 0},
+                {1, nb, nr, AMREX_SPACEDIM});
+    }
 #else
     amrex::ignore_unused(
         parent, group_name, meta, grid, time, time_index, time_record);
@@ -598,6 +634,30 @@ void ReadInputsOp<ActuatorSector, ActSrcSector>::operator()(
     pp.query("swept_quadrature", meta.swept_quadrature);
     pp.query("gaussian_type", meta.gaussian_type);
     pp.query("gaussian_table_error", meta.gaussian_table_error);
+    pp.query("fllc", meta.fllc);
+    if (meta.fllc) {
+        meta.fllc_epsilon_chord = meta.epsilon_chord.x();
+        pp.query("fllc_epsilon_chord", meta.fllc_epsilon_chord);
+        pp.query("fllc_start_time", meta.fllc_start_time);
+        pp.query("fllc_relaxation_factor", meta.fllc_relaxation_factor);
+        std::string type = "variable_chord";
+        bool nonuniform = false;
+        pp.query("fllc_type", type);
+        pp.query("fllc_nonuniform", nonuniform);
+        if (type != "variable_chord" || nonuniform) {
+            amrex::Abort(
+                "Experimental sector FLLC supports variable_chord with "
+                "fllc_nonuniform=false on the sector midpoint grid only");
+        }
+        if (!std::isfinite(meta.fllc_epsilon_chord) ||
+            meta.fllc_epsilon_chord <= 0.0_rt ||
+            !std::isfinite(meta.fllc_relaxation_factor) ||
+            meta.fllc_relaxation_factor <= 0.0_rt ||
+            meta.fllc_relaxation_factor > 1.0_rt ||
+            !std::isfinite(meta.fllc_start_time)) {
+            amrex::Abort("Invalid experimental sector FLLC parameters");
+        }
+    }
 
     sector::require_midpoint(meta.radial_quadrature, "radial_quadrature");
     sector::require_midpoint(meta.swept_quadrature, "swept_quadrature");
@@ -646,7 +706,6 @@ void ReadInputsOp<ActuatorSector, ActSrcSector>::operator()(
     AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
         meta.span_locs.size() == meta.twist_inp.size(),
         "ActuatorSector: span_locs and twist must have the same length");
-
 
     meta.rotor_radius = 0.5_rt * meta.rotor_diameter;
     meta.root_radius = meta.root_radius_fraction * meta.rotor_radius;
@@ -728,6 +787,43 @@ void InitDataOp<ActuatorSector, ActSrcSector>::operator()(
     meta.aoa.assign(nvel, 0.0_rt);
     meta.cl.assign(nvel, 0.0_rt);
     meta.cd.assign(nvel, 0.0_rt);
+    meta.fllc_blades.clear();
+    meta.fllc_velocity_correction.clear();
+    if (meta.fllc) {
+        // The generalized kernel supports varying isotropic source widths.
+        // Directional/anisotropic kernels remain outside this formulation.
+        if (data.sim().io_manager().is_restart()) {
+            amrex::Abort(
+                "ActuatorSector FLLC requires a fresh start: its correction "
+                "history is not stored in checkpoints. Restart with FLLC "
+                "disabled or start a new FLLC calculation from t=0.");
+        }
+        RealList eps;
+        eps.reserve(meta.epsilon_profile.size());
+        for (const auto& profile : meta.epsilon_profile) {
+            const auto width = profile.x();
+            for (int n = 0; n < AMREX_SPACEDIM; ++n) {
+                if (!std::isfinite(profile[n]) || profile[n] <= 0.0_rt ||
+                    std::abs(profile[n] - width) > 1.0e-12_rt * width) {
+                    amrex::Abort(
+                        "Experimental sector FLLC requires an isotropic "
+                        "physical epsilon at each station");
+                }
+            }
+            eps.push_back(width);
+        }
+        if (nr < 2) {
+            amrex::Abort(
+                "Experimental sector FLLC needs at least two stations");
+        }
+        meta.fllc_blades.resize(meta.num_blades);
+        meta.fllc_velocity_correction.assign(nvel, vs::Vector::zero());
+        for (auto& blade : meta.fllc_blades) {
+            blade.initialize(
+                meta.radius, meta.dr, meta.chord, eps, meta.fllc_epsilon_chord,
+                meta.fllc_relaxation_factor);
+        }
+    }
     for (int ip = 0; ip < nvel; ++ip) {
         grid.density[ip] = 1.0_rt;
     }
@@ -792,10 +888,14 @@ void ComputeForceOp<ActuatorSector, ActSrcSector>::operator()(
     // force here is per unit span [m^3/s^2] in kinematic units and is converted
     // to section force later by multiplying by dr.
     const amrex::Real spin_sign = (meta.omega >= 0.0_rt) ? 1.0_rt : -1.0_rt;
+    const bool use_fllc = meta.fllc && tmid >= meta.fllc_start_time;
     for (int ib = 0; ib < meta.num_blades; ++ib) {
         const amrex::Real phase = ::kynema_sgf::utils::two_pi() *
                                   static_cast<amrex::Real>(ib) /
                                   static_cast<amrex::Real>(meta.num_blades);
+        if (use_fllc) {
+            meta.fllc_blades[ib].update();
+        }
         for (int ir = 0; ir < nr; ++ir) {
             const int ip = (ib * nr) + ir;
             vs::Vector e_r;
@@ -812,8 +912,15 @@ void ComputeForceOp<ActuatorSector, ActSrcSector>::operator()(
             const auto spin_vel = e_theta * (meta.omega * meta.radius[ir]);
             const auto blade_vel = body_velocity + frame_vel + spin_vel;
             const auto rel_wind = grid.vel[ip] - blade_vel;
-            const amrex::Real vtheta = rel_wind & e_theta;
-            const amrex::Real vnormal = rel_wind & e_normal;
+            auto correction = vs::Vector::zero();
+            if (use_fllc) {
+                correction = meta.fllc_blades[ib].state.correction_velocity[ir];
+            }
+            if (meta.fllc) {
+                meta.fllc_velocity_correction[ip] = correction;
+            }
+            const amrex::Real vtheta = (rel_wind & e_theta) + correction.x();
+            const amrex::Real vnormal = (rel_wind & e_normal) + correction.y();
             const auto vplane = e_theta * vtheta + e_normal * vnormal;
             const amrex::Real vmag = vs::mag(vplane);
             // AoA is measured in the local tangential-normal blade plane using
@@ -822,7 +929,7 @@ void ComputeForceOp<ActuatorSector, ActSrcSector>::operator()(
             // equivalent to the positive-rotation propeller, while preserving
             // opposite tangential force for torque cancellation.
             const amrex::Real raw_aoa =
-                -std::atan2(vnormal, -spin_sign * vtheta) +
+                std::atan2(vnormal, -spin_sign * vtheta) +
                 (spin_sign * ::kynema_sgf::utils::radians(meta.twist[ir]));
             const amrex::Real aoa =
                 std::remainder(raw_aoa, ::kynema_sgf::utils::two_pi());
@@ -836,7 +943,7 @@ void ComputeForceOp<ActuatorSector, ActSrcSector>::operator()(
             const amrex::Real drag = qval * cd;
             const auto drag_dir =
                 (vmag > constants::EPS) ? vplane.unit() : e_theta;
-            const auto lift_dir = spin_sign * (drag_dir ^ e_r).unit();
+            const auto lift_dir = spin_sign * (e_r ^ drag_dir).unit();
             const auto force_on_fluid =
                 -((lift_dir * lift) + (drag_dir * drag));
             const amrex::Real ftheta = force_on_fluid & e_theta;
@@ -847,6 +954,10 @@ void ComputeForceOp<ActuatorSector, ActSrcSector>::operator()(
             meta.blade_force_theta[ip] = ftheta;
             meta.blade_force_normal[ip] = fnormal;
             meta.vel_rel[ip] = {vtheta, vnormal, 0.0_rt};
+            if (use_fllc) {
+                meta.fllc_blades[ib].store(
+                    ir, force_theta_normal[ip], meta.vel_rel[ip]);
+            }
             meta.aoa[ip] = ::kynema_sgf::utils::degrees(aoa);
             meta.cl[ip] = cl;
             meta.cd[ip] = cd;
@@ -921,8 +1032,8 @@ void ComputeForceOp<ActuatorSector, ActSrcSector>::operator()(
                 grid.epsilon[iq] = meta.epsilon_profile[ir];
                 // Local Gaussian directions: chord, thickness, radial.
                 grid.orientation[iq] = vs::Tensor(
-                    cosine * e_theta - sine * e_normal,
-                    sine * e_theta + cosine * e_normal, e_r);
+                    cosine * e_theta + sine * e_normal,
+                    -sine * e_theta + cosine * e_normal, e_r);
                 ++iq;
             }
         }

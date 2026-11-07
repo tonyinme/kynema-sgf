@@ -564,7 +564,11 @@ Example for ``ActuatorSector``::
 
    **type:** List of real numbers, optional, default = 0.0 0.0
 
-   Twist distribution in degrees at ``span_locs``.
+   Twist distribution in degrees at ``span_locs``. Positive effective pitch
+   produces vehicle lift along the rotor normal and fluid forcing opposite
+   that normal. For an upright drone, body +z is up and downwash is toward -z.
+   In the local convention, ``alpha = spin_sign*twist + atan2(vnormal,
+   -spin_sign*vtheta)``; downward inflow reduces incidence.
 
 .. input_param:: Actuator.ActuatorSector.airfoil_table
 
@@ -626,6 +630,57 @@ Example for ``ActuatorSector``::
    grid, section loads, integrated thrust and torque, local relative velocity
    components ``vel_rel_theta`` and ``vel_rel_normal``, angle of attack, and
    airfoil coefficients.
+
+   Rotor ``thrust`` and sectional forces act on the fluid; vehicle reaction
+   has the opposite sign. For an upright rotor with normal along global +z,
+   vehicle thrust is ``-density * thrust``. Resisting shaft torque is
+   ``density * sign(omega) * torque``. The NetCDF rotor group identifies this
+   convention with ``aerodynamic_convention = upright_v1``. Existing inputs
+   using the old 180-degree body-roll convention must be remapped together
+   with rotor speeds, mirror flags, initial azimuths and structural offsets.
+
+.. input_param:: Actuator.ActuatorSector.fllc
+
+   **type:** Boolean, optional, default = ``false``
+
+   Experimental blade-local adapter to the existing wing filtered lifting-line
+   correction. Each physical blade retains an independent history in its
+   co-rotating section frame. Radial quadrature uses actual midpoint-cell
+   widths, including both endpoints. Swept projection points are not used in
+   the correction integral. Disabled cases retain the uncorrected force path.
+
+   Only ``fllc_type = variable_chord`` and ``fllc_nonuniform = false`` are
+   supported. The effective physical Gaussian may vary along the blade but
+   must be isotropic at each station. The generalized variable-chord integral
+   uses the actual applied width at each source station, including any
+   ``epsilon_min`` floor, and compares it with the local target
+   ``fllc_epsilon_chord * chord``. It never substitutes a single width for a
+   varying profile. Anisotropic widths are rejected. Existing wing calls
+   retain their scalar applied-width path. The relaxed correction
+   history is not checkpointed: FLLC-enabled restarts are rejected. Ordinary
+   FLLC-disabled restarts remain supported.
+
+.. input_param:: Actuator.ActuatorSector.fllc_epsilon_chord
+
+   **type:** Real, optional, default = chordwise ``epsilon_chord``
+
+   Positive target correction width divided by local chord. This is distinct
+   from the physical force-projection width and its ``epsilon_min`` floor.
+
+.. input_param:: Actuator.ActuatorSector.fllc_relaxation_factor
+
+   **type:** Real, optional, default = 0.1
+
+   Correction relaxation factor in the interval (0, 1].
+
+.. input_param:: Actuator.ActuatorSector.fllc_start_time
+
+   **type:** Real, optional, default = 0.0
+
+   Physical activation time in seconds, evaluated at the force-update midpoint.
+   The first active update gathers loads; subsequent updates apply the relaxed
+   correction. It is saved as ``fllc_velocity_correction`` in the local
+   (theta, normal, radial) frame when FLLC is enabled.
 
 
 Drone
@@ -893,6 +948,11 @@ either the ``Actuator.Drone`` defaults or the individual
 ``airfoil_type``, quadrature options, Gaussian options, and
 ``output_frequency``. See the ``ActuatorSector`` parameter descriptions for
 their units and defaults.
+
+The experimental rotor FLLC options are also accepted under ``Actuator.Drone``
+or ``Actuator.<label>``. They apply to rotors only. Arm FLLC is controlled
+separately by ``Actuator.Drone.arm.fllc`` and defaults to false; the body drag
+model does not use FLLC.
 
 At ``output_frequency``, the Drone writes the standard actuator NetCDF file
 ``<label>.nc``. The ``force`` and ``moment`` variables contain the total

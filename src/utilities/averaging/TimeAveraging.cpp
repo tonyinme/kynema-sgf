@@ -86,6 +86,13 @@ void TimeAveraging::post_advance_work()
     const auto cur_time = time.new_time();
     const auto cur_dt = time.delta_t();
 
+    // PostProcessManager also calls this during initialization. A restart
+    // restores a positive dt, but no new interval has been advanced yet.
+    // Preserve the checkpointed averages instead of counting that state twice.
+    if (cur_time <= time.current_time()) {
+        return;
+    }
+
     // Check the following:
     //   1. if we are phase averaging (i.e., only accumulating the average at a
     //   certain frequency), check to see if we are on a time step in which

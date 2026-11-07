@@ -5,6 +5,7 @@
 #include "src/wind_energy/actuator/aero/AirfoilTable.H"
 #include "src/wind_energy/actuator/motion/RigidBodyMotion.H"
 #include "src/wind_energy/actuator/motion/RotorMotion.H"
+#include "src/wind_energy/actuator/sector/sector_fllc.H"
 
 #include <memory>
 #include <string>
@@ -159,6 +160,14 @@ struct ActuatorSectorData
 
     //! Local Gaussian width at radial stations [m]
     VecList epsilon_profile;
+
+    //! Experimental blade-local wing FLLC adapter; disabled by default.
+    bool fllc{false};
+    amrex::Real fllc_start_time{0.0_rt};
+    amrex::Real fllc_relaxation_factor{0.1_rt};
+    amrex::Real fllc_epsilon_chord{0.25_rt};
+    amrex::Vector<sector::SectorFLLCBlade> fllc_blades;
+    VecList fllc_velocity_correction;
 
     //! Number of swept quadrature samples at each radial station [-]
     amrex::Vector<int> theta_counts;

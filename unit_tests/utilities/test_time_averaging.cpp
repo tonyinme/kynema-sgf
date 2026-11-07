@@ -216,4 +216,33 @@ TEST_F(TimeAveragingTest, mismatch_time_interval)
     EXPECT_NEAR(max_f, avg_val_ideal, m_tol);
 }
 
+TEST_F(TimeAveragingTest, restart_initialization_preserves_saved_mean)
+{
+    populate_parameters();
+    amrex::ParmParse pp("tavg");
+    pp.add("averaging_time_interval", -1.0_rt);
+    initialize_mesh();
+    auto& time = sim().time();
+    auto& temp = sim().repo().declare_cc_field("temperature", 1, 1, 1);
+    temp.setVal(100.0_rt);
+    auto& manager = sim().post_manager();
+    manager.pre_init_actions();
+    auto& mean = sim().repo().get_field(m_name);
+    // Reproduce restored fields and a positive dt read from a checkpoint.
+    time.set_restart_time(4, 0.4_rt);
+    time.delta_t() = m_dt;
+    mean.setVal(2.5_rt);
+    manager.post_init_actions();
+    EXPECT_NEAR(utils::field_min(mean), 2.5_rt, m_tol);
+    EXPECT_NEAR(utils::field_max(mean), 2.5_rt, m_tol);
+    // The next real timestep must still update the restored cumulative mean.
+    ASSERT_TRUE(time.new_timestep());
+    time.advance_time();
+    temp.setVal(4.0_rt);
+    manager.post_advance_work();
+    const auto expected = (2.5_rt * 0.4_rt + 4.0_rt * m_dt) / 0.5_rt;
+    EXPECT_NEAR(utils::field_min(mean), expected, m_tol);
+    EXPECT_NEAR(utils::field_max(mean), expected, m_tol);
+}
+
 } // namespace kynema_sgf_tests

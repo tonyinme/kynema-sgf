@@ -804,6 +804,7 @@ TEST_F(
     pp.addarr("body_dimensions", act::RealList{0.025_rt, 0.025_rt});
     pp.add("body_cd", 1.2_rt);
     pp.add("body_epsilon", std::string("momentum_thickness"));
+    pp.addarr("body_offset", act::RealList{0, 0, -0.014_rt});
     pp.addarr("translation_velocity", act::RealList{0, 0, 0});
     for (int n : {1, 3, 8}) {
         pp.addarr("body_num_points", amrex::Vector<int>{n, n});
@@ -826,6 +827,8 @@ TEST_F(
         EXPECT_LE(area / (2 * eps * eps), 0.38 + 1e-14);
         EXPECT_NEAR(eps, std::sqrt(area / 0.76), 1e-12);
         EXPECT_EQ(grid.pos.size(), n * n);
+        for (const auto& position : grid.pos)
+            EXPECT_NEAR(position.z(), -0.014_rt, 1e-12);
         // Broaden the test kernel enough to resolve it on this coarse mesh.
         grid.epsilon.assign(grid.pos.size(), Vector{0.04_rt, 0.04_rt, 0.04_rt});
         for (auto& rotor : data.meta().rotors)

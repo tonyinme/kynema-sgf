@@ -19,18 +19,24 @@ namespace kynema_sgf::actuator {
 
 struct FLLCOp
 {
-    void operator()(ComponentView& data, FLLCData& fllc)
+    void operator()(
+        ComponentView& data,
+        FLLCData& fllc,
+        const RealList* applied_epsilon = nullptr)
     {
         if (!fllc.initialized) {
             return;
         }
         switch (fllc.correction_type) {
         case FLLCType::ConstantChord: {
+            AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+                applied_epsilon == nullptr,
+                "Per-station applied FLLC widths require variable_chord");
             constant_chord(data, fllc);
             break;
         }
         case FLLCType::VariableChord: {
-            variable_chord(data, fllc);
+            variable_chord(data, fllc, applied_epsilon);
             break;
         }
         default:
@@ -162,11 +168,22 @@ struct FLLCOp
         }
     }
 
-    static void variable_chord(ComponentView& data, FLLCData& fllc)
+    static void variable_chord(
+        ComponentView& data,
+        FLLCData& fllc,
+        const RealList* applied_epsilon = nullptr)
     {
         namespace interp = ::kynema_sgf::interp;
 
         const int npts = static_cast<int>(fllc.correction_velocity.size());
+        // Optional rotor widths live on the native source quadrature. Existing
+        // wing calls omit this argument and retain their scalar LES width and
+        // optional nonuniform quadrature unchanged.
+        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+            applied_epsilon == nullptr ||
+                (!fllc.nonuniform &&
+                 applied_epsilon->size() == npts),
+            "Per-station applied FLLC widths require native source quadrature");
         auto& du = fllc.correction_velocity;
 
         auto& nonuniform_r = fllc.nonuniform_r;
@@ -235,7 +252,12 @@ struct FLLCOp
 
             for (int jp = 0; jp < dr.size(); ++jp) {
 
-                const auto eps_les = fllc.epsilon;
+                // Generalized FLLT Eq. (4), Martinez-Tossas et al. (2024):
+                // epsilon(z') belongs to source jp, not observation ip. Both
+                // the applied and target filters stay inside the integral.
+                const auto eps_les = (applied_epsilon == nullptr)
+                                         ? fllc.epsilon
+                                         : (*applied_epsilon)[jp];
                 const auto eps_opt = optimal_epsilon[jp];
                 const auto eps_les2 = eps_les * eps_les;
                 const auto eps_opt2 = eps_opt * eps_opt;
