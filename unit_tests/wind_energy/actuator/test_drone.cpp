@@ -937,4 +937,60 @@ TEST_F(DroneActuatorTest, arms_match_standard_wing_with_fllc_and_2d_projection)
     remove(m_airfoil_file.c_str());
 }
 
+TEST_F(DroneActuatorTest, rotor_perturbation_preserves_structural_forces)
+{
+    namespace act = kynema_sgf::actuator;
+    using kynema_sgf::vs::Vector;
+    write_airfoil();
+    initialize_domain();
+    populate_inputs();
+    amrex::ParmParse pp("Actuator.D1");
+    pp.addarr("translation_velocity", act::RealList{0, 0, 0});
+    pp.addarr("body_dimensions", act::RealList{0.025_rt, 0.025_rt});
+    pp.addarr("body_num_points", amrex::Vector<int>{3, 3});
+    pp.add("body_cd", 1.2_rt);
+    pp.add("body_epsilon", 0.01_rt);
+    pp.add("force_perturbation_amplitude", 0.01_rt);
+    pp.add("force_perturbation_seed", 17);
+    amrex::ParmParse arm("Actuator.Drone.arm");
+    arm.add("num_points", 5);
+    arm.add("pitch", 0.0_rt);
+    arm.add("epsilon", 0.01_rt);
+    arm.add("fllc", false);
+    arm.addarr("chord", act::RealList{0.003_rt, 0.003_rt});
+    arm.add("airfoil_table", m_airfoil_file);
+    act::Drone::DataType data(sim(), "D1", 0);
+    act::ops::ReadInputsOp<act::Drone, act::ActSrcDrone>()(
+        data, act::utils::ActParser("Actuator.Drone", "Actuator.D1"));
+    act::ops::InitDataOp<act::Drone, act::ActSrcDrone>()(data);
+    ASSERT_EQ(data.meta().arms.size(), 4U);
+    for (auto& rotor : data.meta().rotors) {
+        EXPECT_EQ(rotor->data.meta().force_perturbation_amplitude, 0.01_rt);
+        EXPECT_EQ(rotor->data.meta().force_perturbation_seed, 17);
+        rotor->data.meta().force_perturbation_amplitude = 0.0_rt;
+    }
+    std::fill(data.grid().vel.begin(), data.grid().vel.end(), Vector{1, 0, -2});
+    act::ops::UpdateVelOp<act::Drone, act::ActSrcDrone>()(data);
+    act::ops::ComputeForceOp<act::Drone, act::ActSrcDrone>()(data);
+    const auto structural = data.grid().force;
+    const auto positions = data.grid().pos;
+    const auto epsilon = data.grid().epsilon;
+    for (auto& rotor : data.meta().rotors)
+        rotor->data.meta().force_perturbation_amplitude = 0.01_rt;
+    act::ops::ComputeForceOp<act::Drone, act::ActSrcDrone>()(data);
+    Vector sum;
+    for (int i=0; i<static_cast<int>(structural.size()); ++i) {
+        for (int d=0; d<3; ++d) {
+            EXPECT_EQ(data.grid().force[i][d], structural[i][d]);
+            EXPECT_EQ(data.grid().pos[i][d], positions[i][d]);
+            EXPECT_EQ(data.grid().epsilon[i][d], epsilon[i][d]);
+        }
+        sum = sum + data.grid().force[i];
+    }
+    for (auto& rotor : data.meta().rotors)
+        sum = sum + rotor->data.meta().integrated_force;
+    EXPECT_NEAR(kynema_sgf::vs::mag(data.meta().total_force + sum), 0, 1e-12);
+    remove(m_airfoil_file.c_str());
+}
+
 } // namespace kynema_sgf_tests

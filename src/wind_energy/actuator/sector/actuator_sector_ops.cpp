@@ -10,6 +10,8 @@
 #include "src/utilities/ncutils/nc_interface.H"
 #include "src/utilities/trig_ops.H"
 
+#include "src/wind_energy/actuator/sector/force_perturbation.H"
+
 #include <algorithm>
 #include <cmath>
 #include <numbers>
@@ -382,6 +384,28 @@ void prepare_netcdf_group(
         "description",
         "negative fluid moment along rotor normal; resisting shaft torque = "
         "density * sign(omega) * torque");
+    if (meta.force_perturbation_amplitude > 0.0_rt) {
+        grp.put_attr(
+            "force_perturbation_amplitude",
+            std::vector<amrex::Real>{meta.force_perturbation_amplitude});
+        grp.put_attr(
+            "force_perturbation_seed",
+            std::vector<int>{meta.force_perturbation_seed});
+        grp.put_attr(
+            "force_perturbation",
+            "uniform quadrature-point multiplier refreshed each step; "
+            "blade/section loads and thrust/torque are unperturbed");
+        grp.def_var("applied_force", NC_DOUBLE, {nt_name, "ndim"});
+        grp.def_var("applied_moment", NC_DOUBLE, {nt_name, "ndim"});
+        grp.var("applied_force")
+            .put_attr(
+                "description",
+                "sum of perturbed quadrature forces on fluid [m^4 s^-2]");
+        grp.var("applied_moment")
+            .put_attr(
+                "description",
+                "sum of perturbed fluid moments about hub [m^5 s^-2]");
+    }
     grp.def_var("radius", NC_DOUBLE, {nr_name});
     grp.def_var("dr", NC_DOUBLE, {nr_name});
     grp.def_var("chord", NC_DOUBLE, {nr_name});
@@ -490,6 +514,12 @@ void write_netcdf_group(
     grp.var("time_index").put(&time_index, {nt}, {1});
     grp.var("thrust").put(&meta.thrust, {nt}, {1});
     grp.var("torque").put(&meta.torque, {nt}, {1});
+    if (meta.force_perturbation_amplitude > 0.0_rt) {
+        grp.var("applied_force")
+            .put(meta.integrated_force.data(), {nt, 0}, {1, 3});
+        grp.var("applied_moment")
+            .put(meta.integrated_moment.data(), {nt, 0}, {1, 3});
+    }
     grp.var("theta_count").put(meta.theta_counts.data(), {nt, 0}, {1, nr});
     grp.var("xyz").put(
         grid.vel_pos[0].data(), {nt, 0, 0, 0}, {1, nb, nr, AMREX_SPACEDIM});
@@ -634,6 +664,16 @@ void ReadInputsOp<ActuatorSector, ActSrcSector>::operator()(
     pp.query("swept_quadrature", meta.swept_quadrature);
     pp.query("gaussian_type", meta.gaussian_type);
     pp.query("gaussian_table_error", meta.gaussian_table_error);
+    pp.query("force_perturbation_amplitude", meta.force_perturbation_amplitude);
+    pp.query("force_perturbation_seed", meta.force_perturbation_seed);
+    if (!std::isfinite(meta.force_perturbation_amplitude) ||
+        meta.force_perturbation_amplitude < 0.0_rt ||
+        meta.force_perturbation_amplitude > 1.0_rt ||
+        meta.force_perturbation_seed < 0) {
+        amrex::Abort(
+            "Sector force perturbation requires amplitude in [0,1] "
+            "and a nonnegative integer seed");
+    }
     pp.query("fllc", meta.fllc);
     if (meta.fllc) {
         meta.fllc_epsilon_chord = meta.epsilon_chord.x();
@@ -992,6 +1032,7 @@ void ComputeForceOp<ActuatorSector, ActSrcSector>::operator()(
     grid.force.resize(nforce);
     grid.epsilon.resize(nforce);
     grid.orientation.assign(nforce, vs::Tensor::identity());
+    const auto perturbation_key = sector::perturbation_label(data.info().label);
     int iq = 0;
     for (int ib = 0; ib < meta.num_blades; ++ib) {
         const amrex::Real phase = ::kynema_sgf::utils::two_pi() *
@@ -1025,6 +1066,15 @@ void ComputeForceOp<ActuatorSector, ActSrcSector>::operator()(
                     meta.dr[ir] / static_cast<amrex::Real>(ntheta);
                 grid.force[iq] = wt * ((e_theta * force_theta_normal[ip].x()) +
                                        (e_normal * force_theta_normal[ip].y()));
+                if (meta.force_perturbation_amplitude > 0.0_rt) {
+                    grid.force[iq] *=
+                        1.0_rt + meta.force_perturbation_amplitude *
+                                     sector::force_perturbation(
+                                         perturbation_key,
+                                         meta.force_perturbation_seed,
+                                         meta.rotor_index, ib, ir, it,
+                                         time.time_index());
+                }
                 meta.integrated_force = meta.integrated_force + grid.force[iq];
                 meta.integrated_moment =
                     meta.integrated_moment +

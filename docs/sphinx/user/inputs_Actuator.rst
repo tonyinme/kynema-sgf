@@ -639,6 +639,33 @@ Example for ``ActuatorSector``::
    using the old 180-degree body-roll convention must be remapped together
    with rotor speeds, mirror flags, initial azimuths and structural offsets.
 
+.. input_param:: Actuator.ActuatorSector.force_perturbation_amplitude
+
+   **type:** Real number, optional, default = 0.0 (disabled)
+
+   Experimental projected-force multiplier amplitude in [0,1]. Each swept
+   quadrature force is multiplied by ``1 + amplitude * xi``, where ``xi`` is
+   uniform in [-1,1). Setting 0.01 gives a bounded +/-1% perturbation, not a
+   1% RMS perturbation. It changes force amplitude, not Gaussian width or
+   force-point locations. Multipliers change each step and are reproducible
+   across MPI ranks, keyed by label, seed, rotor, blade, radial station,
+   swept point and step. Finite-sample net force is not renormalized.
+
+   Blade/section forces and ``thrust``/``torque`` retain the aerodynamic loads
+   before multiplication; enabled output additionally records ``applied_force``
+   and ``applied_moment`` on the fluid. The Drone vehicle force includes the
+   reaction to the applied force. Flow feedback can change later aerodynamic
+   loads and FLLC corrections. Under ``Actuator.Drone``, this option applies
+   to rotors only; structural body/arm drag is unchanged.
+
+.. input_param:: Actuator.ActuatorSector.force_perturbation_seed
+
+   **type:** Nonnegative integer, optional, default = 0
+
+   Reproducible hash seed for projected-force perturbations. No persistent
+   random-number state or additional random-number checkpoint is needed.
+   The existing FLLC-history restart restriction still applies.
+
 .. input_param:: Actuator.ActuatorSector.fllc
 
    **type:** Boolean, optional, default = ``false``

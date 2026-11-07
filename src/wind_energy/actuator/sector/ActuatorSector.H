@@ -40,6 +40,10 @@ struct ActuatorSectorData
     //! Rotor index within rotor_motion
     int rotor_index{0};
 
+    //! Experimental force multiplier amplitude (zero disables) and hash seed
+    amrex::Real force_perturbation_amplitude{0.0_rt};
+    int force_perturbation_seed{0};
+
     //! Hub offset from the rigid-body center in body coordinates [m]
     vs::Vector body_offset{vs::Vector::zero()};
 

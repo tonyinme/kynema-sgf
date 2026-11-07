@@ -9,6 +9,8 @@
 #include "src/utilities/constants.H"
 #include "src/utilities/tagging/ActuatorRefinement.H"
 
+#include "src/wind_energy/actuator/sector/force_perturbation.H"
+
 #include <cmath>
 #include <fstream>
 #include <limits>
@@ -560,6 +562,112 @@ TEST_F(ActuatorSectorTest, fllc_receives_actual_chord_and_floor_widths)
     }
     EXPECT_TRUE(floored);
     EXPECT_TRUE(chord_set);
+    remove_file(m_afname);
+}
+
+TEST(SectorForcePerturbation, bounds_reproducibility_and_keys)
+{
+    namespace sec = kynema_sgf::actuator::sector;
+    const auto key = sec::perturbation_label("R1");
+    const auto value = sec::force_perturbation(key, 17, 0, 0, 0, 0, 1);
+    EXPECT_EQ(value, sec::force_perturbation(key, 17, 0, 0, 0, 0, 1));
+    EXPECT_NE(value, sec::force_perturbation(key, 18, 0, 0, 0, 0, 1));
+    EXPECT_NE(value, sec::force_perturbation(key, 17, 1, 0, 0, 0, 1));
+    EXPECT_NE(value, sec::force_perturbation(key, 17, 0, 1, 0, 0, 1));
+    EXPECT_NE(value, sec::force_perturbation(key, 17, 0, 0, 1, 0, 1));
+    EXPECT_NE(value, sec::force_perturbation(key, 17, 0, 0, 0, 1, 1));
+    EXPECT_NE(value, sec::force_perturbation(key, 17, 0, 0, 0, 0, 2));
+    EXPECT_NE(
+        value, sec::force_perturbation(
+                   sec::perturbation_label("R2"), 17, 0, 0, 0, 0, 1));
+    double mean = 0, square = 0;
+    for (int step = 0; step < 100000; ++step) {
+        const auto d =
+            0.01 * sec::force_perturbation(key, 17, 0, 0, 0, 0, step);
+        ASSERT_GE(d, -0.01);
+        ASSERT_LT(d, 0.01);
+        mean += d / 100000;
+        square += d * d / 100000;
+    }
+    EXPECT_NEAR(mean, 0, 0.0001);
+    EXPECT_NEAR(square, 0.0001 / 3, 0.000001);
+}
+
+TEST_F(ActuatorSectorTest, force_perturbation_projection_accounting)
+{
+    namespace act = kynema_sgf::actuator;
+    using kynema_sgf::vs::Vector;
+    write_airfoil_file(m_afname);
+    initialize_domain();
+    populate_actuator_inputs();
+    amrex::ParmParse pp("Actuator.R1");
+    pp.addarr("translation_velocity", act::RealList{0, 0, 0});
+    pp.add("force_perturbation_amplitude", 0.01);
+    pp.add("force_perturbation_seed", 17);
+    act::ActuatorSector::DataType data(sim(), "R1", 0);
+    act::ops::ReadInputsOp<act::ActuatorSector, act::ActSrcSector>()(
+        data, act::utils::ActParser("Actuator.ActuatorSector", "Actuator.R1"));
+    EXPECT_EQ(data.meta().force_perturbation_amplitude, 0.01);
+    EXPECT_EQ(data.meta().force_perturbation_seed, 17);
+    act::ops::InitDataOp<act::ActuatorSector, act::ActSrcSector>()(data);
+    auto& m = data.meta();
+    m.force_perturbation_amplitude = 0;
+    act::ops::ComputeForceOp<act::ActuatorSector, act::ActSrcSector>()(data);
+    const auto control = data.grid().force;
+    const auto positions = data.grid().pos;
+    const auto eps = data.grid().epsilon;
+    const auto blade = m.blade_force;
+    const auto thrust = m.thrust;
+    const auto torque = m.torque;
+    m.force_perturbation_amplitude = 0.01;
+    act::ops::ComputeForceOp<act::ActuatorSector, act::ActSrcSector>()(data);
+    auto sum = Vector::zero(), moment = Vector::zero();
+    int iq = 0;
+    for (int ib = 0; ib < m.num_blades; ++ib) {
+        for (int ir = 0; ir < static_cast<int>(m.radius.size()); ++ir) {
+            for (int it = 0; it < m.theta_counts[ir]; ++it, ++iq) {
+                const auto factor =
+                    1 + 0.01 * act::sector::force_perturbation(
+                                   act::sector::perturbation_label("R1"), 17,
+                                   m.rotor_index, ib, ir, it,
+                                   sim().time().time_index());
+                for (int n = 0; n < 3; ++n) {
+                    EXPECT_DOUBLE_EQ(
+                        data.grid().force[iq][n], control[iq][n] * factor);
+                    EXPECT_EQ(data.grid().pos[iq][n], positions[iq][n]);
+                    EXPECT_EQ(data.grid().epsilon[iq][n], eps[iq][n]);
+                }
+                sum = sum + data.grid().force[iq];
+                moment = moment + ((data.grid().pos[iq] - m.center) ^
+                                   data.grid().force[iq]);
+            }
+        }
+    }
+    const auto first = data.grid().force;
+    act::ops::ComputeForceOp<act::ActuatorSector, act::ActSrcSector>()(data);
+    for (int n = 0; n < 3; ++n) {
+        EXPECT_EQ(m.integrated_force[n], sum[n]);
+        EXPECT_EQ(m.integrated_moment[n], moment[n]);
+        EXPECT_TRUE(std::isfinite(sum[n]));
+    }
+    for (int i = 0; i < static_cast<int>(first.size()); ++i)
+        for (int n = 0; n < 3; ++n)
+            EXPECT_EQ(first[i][n], data.grid().force[i][n]);
+    for (int i = 0; i < static_cast<int>(blade.size()); ++i)
+        for (int n = 0; n < 3; ++n) EXPECT_EQ(blade[i][n], m.blade_force[i][n]);
+    EXPECT_EQ(thrust, m.thrust);
+    EXPECT_EQ(torque, m.torque);
+    ++sim().time().time_index();
+    act::ops::ComputeForceOp<act::ActuatorSector, act::ActSrcSector>()(data);
+    double change = 0;
+    for (int i = 0; i < static_cast<int>(first.size()); ++i)
+        change += kynema_sgf::vs::mag(data.grid().force[i] - first[i]);
+    EXPECT_GT(change, 0);
+    m.force_perturbation_amplitude = 0;
+    act::ops::ComputeForceOp<act::ActuatorSector, act::ActSrcSector>()(data);
+    for (int i = 0; i < static_cast<int>(control.size()); ++i)
+        for (int n = 0; n < 3; ++n)
+            EXPECT_EQ(control[i][n], data.grid().force[i][n]);
     remove_file(m_afname);
 }
 
