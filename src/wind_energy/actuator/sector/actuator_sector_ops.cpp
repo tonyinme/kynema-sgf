@@ -88,7 +88,8 @@ void build_radial_grid(ActuatorSectorData& meta)
     RealList dense_r(dense_n);
     RealList metric(dense_n, 0.0_rt);
     const amrex::Real span = meta.rotor_radius - meta.root_radius;
-    AMREX_ALWAYS_ASSERT(span > 0.0_rt);
+    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+        span > 0.0_rt, "span = " + std::to_string(span));
 
     for (int i = 0; i < dense_n; ++i) {
         const amrex::Real xi =
@@ -609,24 +610,43 @@ void ReadInputsOp<ActuatorSector, ActSrcSector>::operator()(
             "ActuatorSector requires specification of one or both of "
             "'epsilon' or 'epsilon_chord'");
     }
-    AMREX_ALWAYS_ASSERT(meta.num_blades > 0);
-    AMREX_ALWAYS_ASSERT(meta.rotor_diameter > 0.0_rt);
-    AMREX_ALWAYS_ASSERT(
-        std::isfinite(meta.epsilon_min) && meta.epsilon_min >= 0.0_rt);
+    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+        meta.num_blades > 0, "ActuatorSector: num_blades must be positive");
+    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+        meta.rotor_diameter > 0.0_rt,
+        "ActuatorSector: rotor_diameter must be positive");
+    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+        std::isfinite(meta.epsilon_min) && meta.epsilon_min >= 0.0_rt,
+        "ActuatorSector: epsilon_min must be finite and nonnegative");
+    // Preserve the directional max(epsilon, epsilon_chord*chord, epsilon_min)
+    // rule. A fixed width does not silently disable the chord or floor inputs.
     for (int n = 0; n < AMREX_SPACEDIM; ++n) {
-        AMREX_ALWAYS_ASSERT(
-            std::isfinite(meta.epsilon[n]) && meta.epsilon[n] >= 0.0_rt);
-        AMREX_ALWAYS_ASSERT(
+        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+            std::isfinite(meta.epsilon[n]) && meta.epsilon[n] >= 0.0_rt,
+            "ActuatorSector: each epsilon component must be finite and "
+            "nonnegative");
+        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
             std::isfinite(meta.epsilon_chord[n]) &&
-            meta.epsilon_chord[n] >= 0.0_rt);
-        AMREX_ALWAYS_ASSERT(
+                meta.epsilon_chord[n] >= 0.0_rt,
+            "ActuatorSector: each epsilon_chord component must be finite and "
+            "nonnegative");
+        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
             meta.epsilon[n] > 0.0_rt || meta.epsilon_chord[n] > 0.0_rt ||
-            meta.epsilon_min > 0.0_rt);
+                meta.epsilon_min > 0.0_rt,
+            "ActuatorSector: each direction needs a positive epsilon, "
+            "epsilon_chord or epsilon_min");
     }
-    AMREX_ALWAYS_ASSERT(meta.root_radius_fraction >= 0.0_rt);
-    AMREX_ALWAYS_ASSERT(meta.root_radius_fraction < 1.0_rt);
-    AMREX_ALWAYS_ASSERT(meta.span_locs.size() == meta.chord_inp.size());
-    AMREX_ALWAYS_ASSERT(meta.span_locs.size() == meta.twist_inp.size());
+    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+        meta.root_radius_fraction >= 0.0_rt &&
+            meta.root_radius_fraction < 1.0_rt,
+        "ActuatorSector: root_radius_fraction must be in [0,1)");
+    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+        meta.span_locs.size() == meta.chord_inp.size(),
+        "ActuatorSector: span_locs and chord must have the same length");
+    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+        meta.span_locs.size() == meta.twist_inp.size(),
+        "ActuatorSector: span_locs and twist must have the same length");
+
 
     meta.rotor_radius = 0.5_rt * meta.rotor_diameter;
     meta.root_radius = meta.root_radius_fraction * meta.rotor_radius;
