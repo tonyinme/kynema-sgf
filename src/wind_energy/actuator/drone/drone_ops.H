@@ -78,6 +78,8 @@ public:
     operator()(int lev, const amrex::MFIter& mfi, const amrex::Geometry& geom);
 
 private:
+    void update_structure_bounds();
+
     Drone::DataType& m_data;
     struct SourcePoint
     {
@@ -85,6 +87,8 @@ private:
         vs::Vector dcoord_flags{1, 1, 1};
         vs::Tensor orientation;
     };
+    // Rebuilt each setup from the existing 4-epsilon structural support.
+    amrex::RealBox m_structure_bounds;
     amrex::Vector<SourcePoint> m_points;
     amrex::Gpu::DeviceVector<SourcePoint> m_device_points;
 };

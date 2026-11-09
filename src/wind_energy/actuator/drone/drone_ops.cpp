@@ -8,6 +8,7 @@
 #include "src/wind_energy/actuator/wing/fixed_wing_ops.H"
 #include "src/utilities/trig_ops.H"
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 
@@ -581,6 +582,57 @@ void ActSrcOp<Drone, ActSrcDrone>::initialize()
     }
 }
 
+void ActSrcOp<Drone, ActSrcDrone>::update_structure_bounds()
+{
+    // Retain the full-domain path if a kernel is unbounded or its frame is
+    // not a rotation. In particular, do not truncate 2D arm projections.
+    m_structure_bounds = m_data.sim().mesh().Geom(0).ProbDomain();
+    if (m_points.empty()) {
+        return;
+    }
+
+    const auto max_coordinate = std::numeric_limits<amrex::Real>::max();
+    vs::Vector lower{max_coordinate, max_coordinate, max_coordinate};
+    vs::Vector upper{-max_coordinate, -max_coordinate, -max_coordinate};
+    const auto rotation_tolerance =
+        64.0_rt * std::numeric_limits<amrex::Real>::epsilon();
+    for (const auto& point : m_points) {
+        const auto& orientation = point.orientation;
+        const std::array rows{
+            orientation.x(), orientation.y(), orientation.z()};
+        for (int j = 0; j < 3; ++j) {
+            if (!std::isfinite(point.dcoord_flags[j]) ||
+                point.dcoord_flags[j] == 0.0_rt) {
+                return;
+            }
+            for (int k = 0; k < 3; ++k) {
+                const amrex::Real expected = (j == k) ? 1.0_rt : 0.0_rt;
+                if (!(std::abs((rows[j] & rows[k]) - expected) <
+                      rotation_tolerance)) {
+                    return;
+                }
+            }
+        }
+        // The kernel maps world distances to local axes with orientation.
+        // Its existing cutoff is sum((local_distance * flags / epsilon)^2)
+        // < 16. For a rotation, each world-axis extent is four times the
+        // norm of the corresponding column scaled by epsilon/abs(flags).
+        for (int d = 0; d < 3; ++d) {
+            amrex::Real extent_squared = 0.0_rt;
+            for (int j = 0; j < 3; ++j) {
+                const auto component = orientation[(3 * j) + d] *
+                                       point.epsilon[j] /
+                                       std::abs(point.dcoord_flags[j]);
+                extent_squared += component * component;
+            }
+            const auto extent = 4.0_rt * std::sqrt(extent_squared);
+            lower[d] = std::min(lower[d], point.pos[d] - extent);
+            upper[d] = std::max(upper[d], point.pos[d] + extent);
+        }
+    }
+    m_structure_bounds = amrex::RealBox(lower.data(), upper.data());
+}
+
 void ActSrcOp<Drone, ActSrcDrone>::setup_op()
 {
     const auto& grid = m_data.grid();
@@ -591,6 +643,7 @@ void ActSrcOp<Drone, ActSrcDrone>::setup_op()
         point.epsilon = grid.epsilon[i];
         point.orientation = grid.orientation[i];
     }
+    update_structure_bounds();
     amrex::Gpu::copy(
         amrex::Gpu::hostToDevice, m_points.begin(), m_points.end(),
         m_device_points.begin());
@@ -605,29 +658,39 @@ void ActSrcOp<Drone, ActSrcDrone>::operator()(
     for (auto& rotor : m_data.meta().rotors) {
         rotor->source(lev, mfi, geom);
     }
-    if (m_points.empty()) return;
+    if (m_points.empty()) {
+        return;
+    }
+    // Keep rotor evaluation above independent of structural support. Grow by
+    // one cell to conservatively include support edges despite roundoff.
+    auto support =
+        ::kynema_sgf::utils::realbox_to_box(m_structure_bounds, geom);
+    support.grow(1);
+    const auto cells = mfi.tilebox() & support;
+    if (cells.isEmpty()) {
+        return;
+    }
     // Drone positions already use the sector sampling time.
     const auto src =
         m_data.sim().repo().get_field("actuator_src_term")(lev).array(mfi);
     const auto lo = geom.ProbLoArray();
     const auto dx = geom.CellSizeArray();
-    const int npts = m_device_points.size();
+    const int npts = static_cast<int>(m_device_points.size());
     const auto* points = m_device_points.data();
-    amrex::ParallelFor(
-        mfi.tilebox(), [=] AMREX_GPU_DEVICE(int i, int j, int k) {
-            const vs::Vector x{
-                lo[0] + (i + 0.5_rt) * dx[0], lo[1] + (j + 0.5_rt) * dx[1],
-                lo[2] + (k + 0.5_rt) * dx[2]};
-            vs::Vector force = vs::Vector::zero();
-            for (int ip = 0; ip < npts; ++ip) {
-                const auto& p = points[ip];
-                const auto dist =
-                    (p.orientation & (x - p.pos)) * p.dcoord_flags;
-                force = force + utils::gaussian3d(dist, p.epsilon) * p.force;
-            }
-            for (int d = 0; d < AMREX_SPACEDIM; ++d)
-                src(i, j, k, d) += force[d];
-        });
+    amrex::ParallelFor(cells, [=] AMREX_GPU_DEVICE(int i, int j, int k) {
+        const vs::Vector x{
+            lo[0] + ((i + 0.5_rt) * dx[0]), lo[1] + ((j + 0.5_rt) * dx[1]),
+            lo[2] + ((k + 0.5_rt) * dx[2])};
+        vs::Vector force = vs::Vector::zero();
+        for (int ip = 0; ip < npts; ++ip) {
+            const auto& p = points[ip];
+            const auto dist = (p.orientation & (x - p.pos)) * p.dcoord_flags;
+            force = force + utils::gaussian3d(dist, p.epsilon) * p.force;
+        }
+        for (int d = 0; d < AMREX_SPACEDIM; ++d) {
+            src(i, j, k, d) += force[d];
+        }
+    });
 }
 
 } // namespace kynema_sgf::actuator::ops

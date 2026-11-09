@@ -14,6 +14,7 @@
 
 #include "gtest/gtest.h"
 
+#include <algorithm>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -979,8 +980,8 @@ TEST_F(DroneActuatorTest, rotor_perturbation_preserves_structural_forces)
         rotor->data.meta().force_perturbation_amplitude = 0.01_rt;
     act::ops::ComputeForceOp<act::Drone, act::ActSrcDrone>()(data);
     Vector sum;
-    for (int i=0; i<static_cast<int>(structural.size()); ++i) {
-        for (int d=0; d<3; ++d) {
+    for (int i = 0; i < static_cast<int>(structural.size()); ++i) {
+        for (int d = 0; d < 3; ++d) {
             EXPECT_EQ(data.grid().force[i][d], structural[i][d]);
             EXPECT_EQ(data.grid().pos[i][d], positions[i][d]);
             EXPECT_EQ(data.grid().epsilon[i][d], epsilon[i][d]);
@@ -991,6 +992,100 @@ TEST_F(DroneActuatorTest, rotor_perturbation_preserves_structural_forces)
         sum = sum + rotor->data.meta().integrated_force;
     EXPECT_NEAR(kynema_sgf::vs::mag(data.meta().total_force + sum), 0, 1e-12);
     remove(m_airfoil_file.c_str());
+}
+
+// Compare pruning with the original full-domain Gaussian evaluation, including
+// anisotropy, rotations, moving support, domain clipping and extruded kernels.
+TEST_F(DroneActuatorTest, structure_support_matches_full_domain_reference)
+{
+    namespace act = kynema_sgf::actuator;
+    using kynema_sgf::vs::Vector;
+    initialize_domain();
+    auto& field = sim().repo().get_field("actuator_src_term");
+    const auto& geom = sim().mesh().Geom(0);
+    amrex::MultiFab reference(
+        field(0).boxArray(), field(0).DistributionMap(), 3, 0);
+    // Rotated anisotropy, extrusion, nonorthonormal frame, scaled flags.
+    for (int scenario = 0; scenario < 4; ++scenario) {
+        SCOPED_TRACE(scenario);
+        act::Drone::DataType data(sim(), "bounds", 0);
+        data.meta().box_points = 1;
+        auto wing = std::make_unique<act::FixedWing::DataType>(sim(), "arm", 0);
+        wing->meta().num_pts = 2;
+        auto flags = Vector::one();
+        if (scenario == 1) {
+            flags = Vector{1, 0, 1};
+        } else if (scenario == 3) {
+            flags = Vector{-1, 0.5_rt, 2};
+        }
+        wing->grid().dcoord_flags = flags;
+        data.meta().arms.push_back(std::move(wing));
+        auto& grid = data.grid();
+        grid.resize(3, 3);
+        auto rotation = act::drone::body_rotation(Vector{21, 37, -18});
+        if (scenario == 2) {
+            rotation.xx() *= 1.2_rt;
+        }
+        for (int i = 0; i < 3; ++i) {
+            grid.epsilon[i] = Vector{0.012_rt, 0.024_rt, 0.018_rt};
+            grid.orientation[i] = rotation;
+            grid.force[i] = Vector{0.4_rt * (i + 1), -0.2_rt, 0.7_rt};
+        }
+        act::ops::ActSrcOp<act::Drone, act::ActSrcDrone> source(data);
+        source.initialize();
+        for (amrex::Real shift : {0.0_rt, 0.17_rt, 1.0_rt, -0.03_rt}) {
+            SCOPED_TRACE(shift);
+            for (int i = 0; i < 3; ++i) {
+                grid.pos[i] =
+                    Vector{shift + (0.025_rt * i), -0.02_rt * i, 0.01_rt * i};
+            }
+            source.setup_op();
+            field.setVal(2.5_rt);
+            reference.setVal(2.5_rt);
+            amrex::GpuArray<Vector, 3> pos, force, eps;
+            for (int i = 0; i < 3; ++i) {
+                pos[i] = grid.pos[i];
+                force[i] = grid.force[i];
+                eps[i] = grid.epsilon[i];
+            }
+            const auto lo = geom.ProbLoArray(), dx = geom.CellSizeArray();
+            for (amrex::MFIter mfi(field(0)); mfi.isValid(); ++mfi) {
+                source(0, mfi, geom);
+                const auto ref = reference.array(mfi);
+                amrex::ParallelFor(
+                    mfi.validbox(), [=] AMREX_GPU_DEVICE(int i, int j, int k) {
+                        const Vector x{
+                            lo[0] + ((i + 0.5_rt) * dx[0]),
+                            lo[1] + ((j + 0.5_rt) * dx[1]),
+                            lo[2] + ((k + 0.5_rt) * dx[2])};
+                        Vector sum = Vector::zero();
+                        for (int p = 0; p < 3; ++p) {
+                            const auto mask = p == 0 ? Vector::one() : flags;
+                            sum = sum + act::utils::gaussian3d(
+                                            (rotation & (x - pos[p])) * mask,
+                                            eps[p]) *
+                                            force[p];
+                        }
+                        for (int d = 0; d < 3; ++d) {
+                            ref(i, j, k, d) += sum[d];
+                        }
+                    });
+            }
+            if (shift == 0) {
+                EXPECT_GT(reference.norm0(2), 2.5);
+            }
+            amrex::GpuArray<amrex::Real, 3> tolerance;
+            for (int d = 0; d < 3; ++d) {
+                tolerance[d] = 64.0_rt *
+                               std::numeric_limits<amrex::Real>::epsilon() *
+                               std::max(1.0_rt, reference.norm0(d));
+            }
+            amrex::MultiFab::Subtract(reference, field(0), 0, 0, 3, 0);
+            for (int d = 0; d < 3; ++d) {
+                EXPECT_LE(reference.norm0(d), tolerance[d]);
+            }
+        }
+    }
 }
 
 } // namespace kynema_sgf_tests

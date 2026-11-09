@@ -728,6 +728,12 @@ Locations are in the drone frame; existing drone motion and rotor layout
 apply to the structure. Forces and moments in the drone output include the
 structure and remain density-normalized, as for the rotors.
 
+Structural projection skips cells outside the existing Gaussian support
+(:math:`4\epsilon` along each local kernel axis). The support bounds account
+for point positions, orientations and widths and update with drone motion.
+This changes only the amount of projection work, not the applied forces or
+input settings. Unbounded 2D arm kernels retain full-domain evaluation.
+
 Required body inputs (under ``Actuator.Drone`` or ``Actuator.<name>``):
 
 * ``body_dimensions``: length and width [m].
