@@ -282,7 +282,7 @@ void Actuator::compute_forces()
 {
     BL_PROFILE("kynema-sgf::actuator::Actuator::compute_forces");
     for (auto& ac : m_actuators) {
-        if (ac->info().actuator_in_proc) {
+        if (ac->info().actuator_in_proc || ac->info().force_update_all_ranks) {
             ac->compute_forces();
         }
     }

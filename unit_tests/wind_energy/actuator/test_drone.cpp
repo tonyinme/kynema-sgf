@@ -19,6 +19,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <set>
 
 #include "AMReX_REAL.H"
 
@@ -161,6 +162,34 @@ protected:
 class RepartitionDroneMesh : public AmrTestMesh
 {
 public:
+    void assign_x_slabs(const amrex::Real time)
+    {
+        const int ranks = amrex::ParallelDescriptor::NProcs();
+        for (int lev = 0; lev <= finestLevel(); ++lev) {
+            const auto boxes = boxArray(lev);
+            const auto& domain = Geom(lev).Domain();
+            const int count = static_cast<int>(boxes.size());
+            amrex::Vector<int> owners(count);
+            for (int i = 0; i < count; ++i) {
+                owners[i] = std::min(
+                    ranks - 1, ranks *
+                                   (boxes[i].smallEnd(0) - domain.smallEnd(0)) /
+                                   domain.length(0));
+            }
+            RemakeLevel(lev, time, boxes, amrex::DistributionMapping(owners));
+        }
+    }
+
+    void assign_mesh_to_rank(const int rank, const amrex::Real time)
+    {
+        for (int lev = 0; lev <= finestLevel(); ++lev) {
+            const auto boxes = boxArray(lev);
+            const amrex::DistributionMapping distribution(
+                amrex::Vector<int>(boxes.size(), rank));
+            RemakeLevel(lev, time, boxes, distribution);
+        }
+    }
+
     void move_refinement(const int coarse_cell_shift, const amrex::Real time)
     {
         m_coarse_cell_shift = coarse_cell_shift;
@@ -342,6 +371,9 @@ TEST_F(DroneActuatorTest, composite_lifecycle)
     }
 
     actuator.post_init_actions();
+    int sampling_owners = drone->info().sample_vel_in_proc ? 1 : 0;
+    amrex::ParallelDescriptor::ReduceIntSum(sampling_owners);
+    EXPECT_EQ(sampling_owners, 1);
     actuator.pre_advance_work();
 
     remove(m_airfoil_file.c_str());
@@ -1086,6 +1118,469 @@ TEST_F(DroneActuatorTest, structure_support_matches_full_domain_reference)
             }
         }
     }
+}
+
+namespace {
+class DronePointContainer : public kynema_sgf::actuator::ActuatorContainer
+{
+public:
+    DronePointContainer(amrex::AmrCore& mesh, const int objects)
+        : ActuatorContainer(mesh, objects)
+    {}
+    kynema_sgf::actuator::ActuatorCloud& cloud() { return point_data(); }
+};
+
+class DroneOwnershipTest : public DroneActuatorTest
+{
+protected:
+    struct Scenario
+    {
+        bool structure{true};
+        bool moving{false};
+        bool repartition{false};
+        bool variable_speed{false};
+        bool extruded{false};
+    };
+
+    void populate_parameters() override
+    {
+        DroneActuatorTest::populate_parameters();
+        amrex::ParmParse amr("amr");
+        amr.add("max_grid_size", 4);
+        amr.add("blocking_factor", 1);
+        amrex::ParmParse time("time");
+        time.add("verbose", -1);
+    }
+
+    void create_mesh_instance() override
+    {
+        MeshTest::create_mesh_instance<RepartitionDroneMesh>();
+    }
+
+    void check_sampling(const Scenario scenario)
+    {
+        namespace act = kynema_sgf::actuator;
+        namespace ops = act::ops;
+        using kynema_sgf::vs::mag;
+        const int rank = amrex::ParallelDescriptor::MyProc();
+        const int ranks = amrex::ParallelDescriptor::NProcs();
+        if (amrex::ParallelDescriptor::IOProcessor()) {
+            write_airfoil();
+        }
+        amrex::ParallelDescriptor::Barrier();
+        populate_inputs();
+        amrex::ParmParse drone("Actuator.Drone");
+        drone.add("rotor_diameter", 0.0468_rt);
+        drone.addarr("rotor_omegas", act::RealList{2500, -2500, 2500, -2500});
+        drone.addarr(
+            "mirror_blades",
+            amrex::Vector<std::string>{"false", "true", "false", "true"});
+        drone.add("root_radius_fraction", 0.12_rt);
+        drone.addarr("chord", act::RealList{0.0068_rt, 0.0068_rt});
+        drone.add("min_chord_dr", 25.0_rt);
+        drone.add("epsilon_min", 0.0015_rt);
+        drone.add("fllc", true);
+        drone.add("fllc_start_time", -1.0_rt);
+        drone.add("fllc_epsilon_chord", 0.25_rt);
+        if (scenario.structure) {
+            drone.addarr("body_dimensions", act::RealList{0.025_rt, 0.025_rt});
+            drone.addarr("body_num_points", amrex::Vector<int>{10, 10});
+            drone.add("body_cd", 1.2_rt);
+            drone.add("body_epsilon", 0.006_rt);
+            amrex::ParmParse arm("Actuator.Drone.arm");
+            arm.add("num_points", 12);
+            arm.add("pitch", 17.0_rt);
+            arm.addarr("epsilon", act::RealList{0.002_rt, 0.004_rt, 0.006_rt});
+            arm.add("fllc", false);
+            arm.add("disable_spanwise_gaussian", scenario.extruded);
+            arm.addarr("chord", act::RealList{0.003_rt, 0.003_rt});
+            arm.add("airfoil_table", m_airfoil_file);
+        }
+        // Two distinct roots and private communicators exercise cross-talk.
+        for (int n = 0; n < 2; ++n) {
+            amrex::ParmParse instance("Actuator.D" + std::to_string(n + 1));
+            instance.addarr("arm_length", act::RealList{0.0325_rt});
+            instance.addarr(
+                "center",
+                act::RealList{
+                    -0.12_rt + (0.01_rt * n), 0.01_rt * n, -0.0625_rt});
+            instance.addarr(
+                "translation_velocity",
+                act::RealList{scenario.moving ? 4.0_rt : 0.0_rt, 0, 0});
+            instance.addarr(
+                "angular_velocity", scenario.moving ? act::RealList{3, -2, 4}
+                                                    : act::RealList{0, 0, 0});
+        }
+        initialize_domain();
+        dynamic_cast<RepartitionDroneMesh&>(mesh()).assign_x_slabs(0.0_rt);
+        const int boxes = static_cast<int>(mesh().boxArray(0).size());
+        EXPECT_EQ(boxes, 64);
+        for (int i = 0; i < boxes; ++i) {
+            EXPECT_EQ(
+                mesh().DistributionMap(0)[i],
+                ranks * mesh().boxArray(0)[i].smallEnd(0) / 16);
+        }
+        sim().time().delta_t() = 1.0_rt / 61440;
+        using Source = ops::ActSrcOp<act::Drone, act::ActSrcDrone>;
+        amrex::Vector<std::unique_ptr<act::Drone::DataType>> actual, reference;
+        amrex::Vector<std::unique_ptr<Source>> sources, reference_sources;
+        amrex::Vector<int> roots;
+        amrex::Vector<int> proc_count(ranks, 0);
+        for (int n = 0; n < 2; ++n) {
+            const auto label = "D" + std::to_string(n + 1);
+            actual.push_back(
+                std::make_unique<act::Drone::DataType>(sim(), label, n));
+            reference.push_back(
+                std::make_unique<act::Drone::DataType>(sim(), label, n));
+            const act::utils::ActParser parser(
+                "Actuator.Drone", "Actuator." + label);
+            ops::ReadInputsOp<act::Drone, act::ActSrcDrone>()(
+                *actual[n], parser);
+            ops::ReadInputsOp<act::Drone, act::ActSrcDrone>()(
+                *reference[n], parser);
+            EXPECT_TRUE(actual[n]->info().force_update_all_ranks);
+            ops::determine_root_proc<act::Drone>(*actual[n], proc_count);
+            roots.push_back(actual[n]->info().root_proc);
+            ops::InitDataOp<act::Drone, act::ActSrcDrone>()(*actual[n]);
+            // The unregistered reference advances complete histories locally.
+            ops::InitDataOp<act::Drone, act::ActSrcDrone>()(*reference[n]);
+            reference[n]->info().actuator_in_proc = true;
+            sources.push_back(std::make_unique<Source>(*actual[n]));
+            reference_sources.push_back(
+                std::make_unique<Source>(*reference[n]));
+            sources.back()->initialize();
+            reference_sources.back()->initialize();
+            EXPECT_EQ(
+                actual[n]->meta().rotors.front()->data.meta().radius.size(),
+                76U);
+        }
+        bool changed_participants = false;
+        bool changed_force_count = false;
+        std::set<int> initial_participants;
+        amrex::Long first_force_count = -1;
+        for (int step = 0; step < 4; ++step) {
+            SCOPED_TRACE(step);
+            sim().time().current_time() = step * 0.02_rt;
+            sim().time().time_index() = step;
+            sim().time().delta_t() = scenario.variable_speed && step % 2 != 0
+                                         ? 1.0_rt / 15360
+                                         : 1.0_rt / 61440;
+            sim().time().advance_time();
+            if (scenario.variable_speed) {
+                amrex::ParmParse speed(
+                    "ownership_speed" + std::to_string(step));
+                const amrex::Real omega = 2000.0_rt + (750.0_rt * step);
+                speed.addarr(
+                    "rotor_omegas",
+                    act::RealList{omega, -omega, omega, -omega});
+                auto motion = std::make_shared<act::motion::RotorMotion>();
+                motion->read_drone_inputs(
+                    act::utils::ActParser(
+                        "ownership_speed" + std::to_string(step),
+                        "ownership_speed" + std::to_string(step)),
+                    4);
+                for (auto* collection : {&actual, &reference}) {
+                    for (auto& data : *collection) {
+                        data->meta().rotor_motion = motion;
+                        for (auto& rotor : data->meta().rotors) {
+                            rotor->data.meta().rotor_motion = motion;
+                        }
+                    }
+                }
+            }
+            if (scenario.repartition) {
+                const int owner = step % ranks;
+                dynamic_cast<RepartitionDroneMesh&>(mesh()).assign_mesh_to_rank(
+                    owner, sim().time().current_time());
+                for (auto& data : actual) {
+                    ops::determine_influenced_procs<act::Drone>(*data);
+                    EXPECT_EQ(data->meta().sampling_proc, owner);
+                }
+            }
+            auto& velocity = sim().repo().get_field("velocity");
+            auto& density = sim().repo().get_field("density");
+            const auto dx = mesh().Geom(0).CellSizeArray();
+            const auto lo = mesh().Geom(0).ProbLoArray();
+            const auto vel = velocity(0).arrays();
+            const auto rho = density(0).arrays();
+            amrex::ParallelFor(
+                velocity(0), velocity.num_grow(),
+                [=] AMREX_GPU_DEVICE(int n, int i, int j, int k) {
+                    const amrex::Real x = lo[0] + ((i + 0.5_rt) * dx[0]);
+                    const amrex::Real y = lo[1] + ((j + 0.5_rt) * dx[1]);
+                    const amrex::Real z = lo[2] + ((k + 0.5_rt) * dx[2]);
+                    vel[n](i, j, k, 0) = 0.4_rt + (0.2_rt * x);
+                    vel[n](i, j, k, 1) = -0.1_rt + (0.3_rt * y);
+                    vel[n](i, j, k, 2) = -1.0_rt + (0.1_rt * z);
+                    rho[n](i, j, k) = 1.2_rt + (0.02_rt * x);
+                });
+            amrex::Gpu::streamSynchronize();
+            int objects = 0;
+            for (const auto& data : actual) {
+                objects += data->info().sample_vel_in_proc ? 1 : 0;
+            }
+            DronePointContainer particles(mesh(), objects);
+            auto& cloud = particles.cloud();
+            int object = 0;
+            for (int n = 0; n < 2; ++n) {
+                if (actual[n]->info().sample_vel_in_proc) {
+                    cloud.global_id[object] = n;
+                    cloud.num_pts[object++] =
+                        static_cast<int>(actual[n]->grid().vel.size());
+                }
+            }
+            particles.initialize_container();
+            int total = particles.num_actuator_points();
+            amrex::ParallelDescriptor::ReduceIntSum(total);
+            const int points = scenario.structure ? 756 : 608;
+            EXPECT_EQ(total, 2 * points);
+            amrex::Long offset = 0;
+            for (const auto& data : actual) {
+                if (data->info().sample_vel_in_proc) {
+                    ops::UpdatePosOp<act::Drone, act::ActSrcDrone>()(*data);
+                    const auto& positions = data->grid().vel_pos;
+                    std::ranges::copy(
+                        positions, cloud.position.begin() + offset);
+                    offset += positions.size();
+                }
+            }
+            particles.update_positions();
+            EXPECT_EQ(particles.NumberOfParticlesAtLevel(0), 2 * points);
+            particles.sample_fields(velocity, density);
+            offset = 0;
+            for (int n = 0; n < 2; ++n) {
+                auto& data = *actual[n];
+                auto& ref = *reference[n];
+                if (data.info().sample_vel_in_proc) {
+                    std::copy_n(
+                        cloud.velocity.begin() + offset, points,
+                        data.grid().vel.begin());
+                    std::copy_n(
+                        cloud.density.begin() + offset, points,
+                        data.grid().density.begin());
+                    offset += points;
+                }
+                ops::UpdatePosOp<act::Drone, act::ActSrcDrone>()(ref);
+                for (int i = 0; i < points; ++i) {
+                    const auto& position = ref.grid().vel_pos[i];
+                    ref.grid().vel[i] = {
+                        0.4_rt + (0.2_rt * position.x()),
+                        -0.1_rt + (0.3_rt * position.y()),
+                        -1.0_rt + (0.1_rt * position.z())};
+                    ref.grid().density[i] = 1.2_rt + (0.02_rt * position.x());
+                }
+                ops::UpdateVelOp<act::Drone, act::ActSrcDrone>()(ref);
+                ops::ComputeForceOp<act::Drone, act::ActSrcDrone>()(ref);
+                // Coordination runs on every rank, including previously
+                // excluded workers.
+                ops::ComputeForceOp<act::Drone, act::ActSrcDrone>()(data);
+                EXPECT_EQ(data.info().root_proc, roots[n]);
+                EXPECT_NEAR(
+                    data.meta()
+                        .body_motion->position(sim().time().current_time())
+                        .x(),
+                    -0.12_rt + (0.01_rt * n) +
+                        (scenario.moving ? 4.0_rt * step * 0.02_rt : 0.0_rt),
+                    1e-13);
+                if (n == 0 && scenario.moving && !scenario.repartition &&
+                    !scenario.extruded) {
+                    if (step == 0) {
+                        EXPECT_LT(data.info().bound_box.hi(0), 0);
+                    }
+                    if (step == 3) {
+                        EXPECT_GT(data.info().bound_box.lo(0), 0);
+                    }
+                }
+                EXPECT_TRUE(data.info().procs.contains(roots[n]));
+                EXPECT_TRUE(
+                    data.info().procs.contains(data.meta().sampling_proc));
+                if (n == 0) {
+                    if (step == 0) {
+                        initial_participants = data.info().procs;
+                    } else {
+                        changed_participants |=
+                            data.info().procs != initial_participants;
+                    }
+                }
+                if (rank == roots[n]) {
+                    EXPECT_NEAR(
+                        mag(data.meta().total_force - ref.meta().total_force),
+                        0, 1e-11);
+                    EXPECT_NEAR(
+                        mag(data.meta().total_moment - ref.meta().total_moment),
+                        0, 1e-11);
+                    for (int i = 0; i < points; ++i) {
+                        EXPECT_NEAR(
+                            mag(data.grid().vel_pos[i] - ref.grid().vel_pos[i]),
+                            0, 1e-13);
+                        EXPECT_NEAR(
+                            mag(data.grid().vel[i] - ref.grid().vel[i]), 0,
+                            1e-13);
+                        EXPECT_NEAR(
+                            data.grid().density[i], ref.grid().density[i],
+                            1e-13);
+                    }
+                }
+                for (int r = 0; r < 4; ++r) {
+                    const auto& rotor = data.meta().rotors[r]->data;
+                    const auto& gold = ref.meta().rotors[r]->data;
+                    if (data.info().actuator_in_proc) {
+                        EXPECT_EQ(
+                            rotor.grid().force.size(),
+                            gold.grid().force.size());
+                        for (amrex::Long i = 0;
+                             i < std::min(
+                                     rotor.grid().force.size(),
+                                     gold.grid().force.size());
+                             ++i) {
+                            EXPECT_NEAR(
+                                mag(rotor.grid().force[i] -
+                                    gold.grid().force[i]),
+                                0, 1e-11);
+                            EXPECT_NEAR(
+                                mag(rotor.grid().pos[i] - gold.grid().pos[i]),
+                                0, 1e-13);
+                            EXPECT_NEAR(
+                                mag(rotor.grid().epsilon[i] -
+                                    gold.grid().epsilon[i]),
+                                0, 1e-13);
+                            for (int d = 0; d < 9; ++d) {
+                                EXPECT_NEAR(
+                                    rotor.grid().orientation[i][d],
+                                    gold.grid().orientation[i][d], 1e-13);
+                            }
+                        }
+                    }
+                    if (rank == roots[n]) {
+                        amrex::Real correction = 0;
+                        for (amrex::Long i = 0;
+                             i < rotor.meta().fllc_velocity_correction.size();
+                             ++i) {
+                            const auto value =
+                                rotor.meta().fllc_velocity_correction[i];
+                            EXPECT_NEAR(
+                                mag(value -
+                                    gold.meta().fllc_velocity_correction[i]),
+                                0, 1e-11);
+                            EXPECT_NEAR(
+                                rotor.meta().aoa[i], gold.meta().aoa[i], 1e-11);
+                            EXPECT_NEAR(
+                                rotor.meta().cl[i], gold.meta().cl[i], 1e-11);
+                            EXPECT_NEAR(
+                                rotor.meta().cd[i], gold.meta().cd[i], 1e-11);
+                            correction += mag(value);
+                        }
+                        if (step == 3) {
+                            EXPECT_GT(correction, 0);
+                        }
+                    } else {
+                        for (const auto& blade : rotor.meta().fllc_blades) {
+                            EXPECT_FALSE(blade.have_loads);
+                        }
+                    }
+                }
+                if (data.info().actuator_in_proc) {
+                    EXPECT_EQ(
+                        data.grid().force.size(), ref.grid().force.size());
+                    for (amrex::Long i = 0; i < data.grid().force.size(); ++i) {
+                        EXPECT_NEAR(
+                            mag(data.grid().force[i] - ref.grid().force[i]), 0,
+                            1e-11);
+                        EXPECT_NEAR(
+                            mag(data.grid().pos[i] - ref.grid().pos[i]), 0,
+                            1e-13);
+                    }
+                }
+                if (n == 0 && rank == roots[n]) {
+                    const auto count =
+                        data.meta().rotors.front()->data.grid().force.size();
+                    if (first_force_count < 0) {
+                        first_force_count = count;
+                    } else {
+                        changed_force_count |= count != first_force_count;
+                    }
+                }
+                sources[n]->setup_op();
+                reference_sources[n]->setup_op();
+            }
+            if (!scenario.repartition && !scenario.extruded && step == 0 &&
+                ranks > 1) {
+                EXPECT_LT(
+                    actual.front()->info().procs.size(),
+                    static_cast<size_t>(ranks));
+            }
+            auto& field = sim().repo().get_field("actuator_src_term");
+            field.setVal(0.0_rt);
+            for (amrex::MFIter mfi(field(0)); mfi.isValid(); ++mfi) {
+                for (int n = 0; n < 2; ++n) {
+                    if (actual[n]->info().actuator_in_proc) {
+                        (*sources[n])(0, mfi, mesh().Geom(0));
+                    }
+                }
+            }
+            amrex::MultiFab gold(
+                field(0).boxArray(), field(0).DistributionMap(), 3, 0);
+            gold.setVal(0.0_rt);
+            amrex::MultiFab::Copy(gold, field(0), 0, 0, 3, 0);
+            field.setVal(0.0_rt);
+            for (amrex::MFIter mfi(field(0)); mfi.isValid(); ++mfi) {
+                for (auto& source : reference_sources) {
+                    (*source)(0, mfi, mesh().Geom(0));
+                }
+            }
+            const auto norm = std::max(
+                {field(0).norm0(0), field(0).norm0(1), field(0).norm0(2)});
+            const auto scale = std::max(1.0_rt, norm);
+            EXPECT_GT(norm, 0.0_rt);
+            amrex::MultiFab::Subtract(gold, field(0), 0, 0, 3, 0);
+            for (int d = 0; d < 3; ++d) {
+                EXPECT_LE(gold.norm0(d), 1e-11_rt * scale);
+            }
+        }
+        if (scenario.moving && !scenario.extruded && ranks > 1) {
+            EXPECT_TRUE(changed_participants);
+        }
+        if (scenario.variable_speed) {
+            int changed = changed_force_count ? 1 : 0;
+            amrex::ParallelDescriptor::ReduceIntMax(changed);
+            EXPECT_EQ(changed, 1);
+        }
+        amrex::ParallelDescriptor::Barrier();
+        if (amrex::ParallelDescriptor::IOProcessor()) {
+            remove(m_airfoil_file.c_str());
+        }
+    }
+};
+} // namespace
+
+TEST_F(DroneOwnershipTest, single_owner_structure_with_fllc)
+{
+    check_sampling({});
+}
+
+TEST_F(DroneOwnershipTest, moving_structure_crosses_rank_boundaries_with_fllc)
+{
+    check_sampling({.moving = true});
+}
+
+TEST_F(DroneOwnershipTest, single_owner_rotors_with_empty_root_and_repartition)
+{
+    check_sampling({.structure = false, .repartition = true});
+}
+
+TEST_F(DroneOwnershipTest, structure_repartition_preserves_root_fllc)
+{
+    check_sampling({.moving = true, .repartition = true});
+}
+
+TEST_F(DroneOwnershipTest, variable_sector_counts_with_fllc)
+{
+    check_sampling({.moving = true, .variable_speed = true});
+}
+
+TEST_F(DroneOwnershipTest, extruded_arm_projection_matches_reference)
+{
+    check_sampling({.moving = true, .extruded = true});
 }
 
 } // namespace kynema_sgf_tests

@@ -9,6 +9,8 @@
 #include "src/wind_energy/actuator/wing/FixedWing.H"
 #include "src/wind_energy/actuator/FLLC.H"
 
+#include "AMReX_ParallelDescriptor.H"
+
 #include <memory>
 #include <string>
 
@@ -33,6 +35,14 @@ struct DroneData
     VecList body_points;
     TensorList arm_frames;
     amrex::Vector<std::unique_ptr<FixedWing::DataType>> arms;
+    // Sampling has one owner, preferably the IO root. An empty IO-root rank
+    // delegates particle creation to a rank that actually owns mesh cells.
+    int sampling_proc{-1};
+    RealList sampling_buffer;
+    RealList projection_buffer;
+#ifdef AMREX_USE_MPI
+    std::shared_ptr<MPI_Comm> sampling_comm;
+#endif
     int box_points{0};
     amrex::Real box_drag_area{0}, box_epsilon{0};
     int num_rotors{0};

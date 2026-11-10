@@ -7,6 +7,13 @@
 namespace kynema_sgf::actuator::ops {
 
 template <>
+void determine_root_proc<Drone>(
+    Drone::DataType& data, amrex::Vector<int>& act_proc_count);
+
+template <>
+void determine_influenced_procs<Drone>(Drone::DataType& data);
+
+template <>
 struct ReadInputsOp<Drone, ActSrcDrone>
 {
     void operator()(Drone::DataType& data, const utils::ActParser& pp);
@@ -78,8 +85,6 @@ public:
     operator()(int lev, const amrex::MFIter& mfi, const amrex::Geometry& geom);
 
 private:
-    void update_structure_bounds();
-
     Drone::DataType& m_data;
     struct SourcePoint
     {

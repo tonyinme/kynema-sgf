@@ -19,6 +19,278 @@ using namespace amrex::literals;
 namespace kynema_sgf::actuator::ops {
 namespace {
 
+// One physical sample cloud; the aerodynamic owner remains fixed on regrid.
+void select_sampling_owner(Drone::DataType& data)
+{
+    auto& info = data.info();
+    const auto mesh_procs = utils::determine_influenced_procs(
+        data.sim().mesh(), data.sim().mesh().Geom(0).ProbDomain());
+    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+        !mesh_procs.empty(), "Drone sampling requires a nonempty mesh");
+    auto owner = info.root_proc;
+    if (!mesh_procs.contains(owner)) {
+        const auto candidate =
+            std::ranges::find_if(info.procs, [&](const int rank) {
+                return mesh_procs.contains(rank);
+            });
+        owner =
+            candidate != info.procs.end() ? *candidate : *mesh_procs.begin();
+    }
+    data.meta().sampling_proc = owner;
+    info.procs.insert(owner);
+    const auto rank = amrex::ParallelDescriptor::MyProc();
+    info.actuator_in_proc = info.procs.contains(rank);
+    info.sample_vel_in_proc = rank == owner;
+}
+
+void share_sampled_fields(Drone::DataType& data)
+{
+    auto& meta = data.meta();
+    const auto& info = data.info();
+    const auto rank = amrex::ParallelDescriptor::MyProc();
+    if (meta.sampling_proc < 0 ||
+        (rank != meta.sampling_proc && !info.is_root_proc)) {
+        return;
+    }
+    BL_PROFILE("kynema-sgf::actuator::Drone::share_sampled_fields");
+    // The root may delegate sampling when it has no mesh cells.
+    UpdatePosOp<Drone, ActSrcDrone>()(data);
+#ifdef AMREX_USE_MPI
+    if (meta.sampling_proc != info.root_proc) {
+        auto& grid = data.grid();
+        auto& buffer = meta.sampling_buffer;
+        const auto count = grid.vel.size();
+        buffer.resize(4 * count);
+        AMREX_ALWAYS_ASSERT(meta.sampling_comm);
+        constexpr int sample_tag = 1001;
+        if (rank == meta.sampling_proc) {
+            for (amrex::Long i = 0; i < count; ++i) {
+                for (int d = 0; d < 3; ++d) {
+                    buffer[(4 * i) + d] = grid.vel[i][d];
+                }
+                buffer[(4 * i) + 3] = grid.density[i];
+            }
+            amrex::ParallelDescriptor::Send(
+                buffer.data(), buffer.size(), info.root_proc, sample_tag,
+                *meta.sampling_comm);
+        } else {
+            amrex::ParallelDescriptor::Recv(
+                buffer.data(), buffer.size(), meta.sampling_proc, sample_tag,
+                *meta.sampling_comm);
+            for (amrex::Long i = 0; i < count; ++i) {
+                for (int d = 0; d < 3; ++d) {
+                    grid.vel[i][d] = buffer[(4 * i) + d];
+                }
+                grid.density[i] = buffer[(4 * i) + 3];
+            }
+        }
+    }
+#endif
+    if (info.is_root_proc) {
+        UpdateVelOp<Drone, ActSrcDrone>()(data);
+    }
+}
+
+// Bound the actual quadrature points, including motion throughout the step.
+// A sphere using the largest width contains every rotated anisotropic kernel.
+amrex::RealBox projection_bounds(
+    const ActGrid& grid, const amrex::RealBox& domain, const amrex::Real cutoff)
+{
+    if (grid.pos.empty()) {
+        return domain;
+    }
+    vs::Vector lower = grid.pos.front(), upper = lower;
+    for (int i = 0; i < static_cast<int>(grid.pos.size()); ++i) {
+        const auto& frame = grid.orientation[i];
+        const std::array rows{frame.x(), frame.y(), frame.z()};
+        for (int j = 0; j < 3; ++j) {
+            for (int k = 0; k < 3; ++k) {
+                if (!(std::abs(
+                          (rows[j] & rows[k]) - (j == k ? 1.0_rt : 0.0_rt)) <
+                      64 * std::numeric_limits<amrex::Real>::epsilon())) {
+                    return domain;
+                }
+            }
+        }
+        const auto& eps = grid.epsilon[i];
+        const auto extent = cutoff * std::max({eps.x(), eps.y(), eps.z()});
+        if (!std::isfinite(extent)) {
+            return domain;
+        }
+        for (int d = 0; d < 3; ++d) {
+            lower[d] = std::min(lower[d], grid.pos[i][d] - extent);
+            upper[d] = std::max(upper[d], grid.pos[i][d] + extent);
+        }
+    }
+    return {lower.data(), upper.data()};
+}
+
+amrex::RealBox structure_bounds(const Drone::DataType& data)
+{
+    const auto& domain = data.sim().mesh().Geom(0).ProbDomain();
+    for (const auto& arm : data.meta().arms) {
+        for (const auto flag : arm->grid().dcoord_flags) {
+            if (flag != 1.0_rt) {
+                return domain;
+            }
+        }
+    }
+    return projection_bounds(data.grid(), domain, 4.0_rt);
+}
+
+void distribute_projection(Drone::DataType& data)
+{
+    auto& info = data.info();
+    // Unregistered operators retain their local evaluation path.
+    if (info.root_proc < 0) {
+        return;
+    }
+    BL_PROFILE("kynema-sgf::actuator::Drone::distribute_projection");
+    auto& meta = data.meta();
+    amrex::Vector<ActGrid*> grids{&data.grid()};
+    for (auto& rotor : meta.rotors) {
+        grids.push_back(&rotor->data.grid());
+    }
+    amrex::Vector<int> counts(grids.size()), procs;
+    RealList bounds(6 * grids.size());
+    int num_procs = 0;
+    if (info.is_root_proc) {
+        const auto& domain = data.sim().mesh().Geom(0).ProbDomain();
+        vs::Vector lo{domain.hi(0), domain.hi(1), domain.hi(2)};
+        vs::Vector hi{domain.lo(0), domain.lo(1), domain.lo(2)};
+        for (int g = 0; g < static_cast<int>(grids.size()); ++g) {
+            counts[g] = static_cast<int>(grids[g]->pos.size());
+            const auto box = g == 0 ? structure_bounds(data)
+                                    : projection_bounds(
+                                          *grids[g], domain,
+                                          meta.rotors[g - 1]
+                                              ->data.meta()
+                                              .support_radius_over_epsilon);
+            for (int d = 0; d < 3; ++d) {
+                bounds[(6 * g) + d] = box.lo(d);
+                bounds[(6 * g) + 3 + d] = box.hi(d);
+                if (counts[g] > 0) {
+                    lo[d] = std::min(lo[d], box.lo(d));
+                    hi[d] = std::max(hi[d], box.hi(d));
+                }
+            }
+        }
+        info.bound_box = amrex::RealBox(lo.data(), hi.data());
+        info.procs = utils::determine_influenced_procs(
+            data.sim().mesh(), info.bound_box);
+        info.procs.insert(info.root_proc);
+        info.procs.insert(meta.sampling_proc);
+        procs.assign(info.procs.begin(), info.procs.end());
+        num_procs = static_cast<int>(procs.size());
+        if (data.sim().time().time_index() == 0) {
+            amrex::Print(info.root_proc)
+                << "Drone " << info.label << ": aerodynamic owner "
+                << info.root_proc << ", sampling owner " << meta.sampling_proc
+                << ", projection ranks " << num_procs << "/"
+                << amrex::ParallelDescriptor::NProcs() << '\n';
+        }
+    }
+#ifdef AMREX_USE_MPI
+    if (amrex::ParallelDescriptor::NProcs() > 1) {
+        const MPI_Comm comm = *meta.sampling_comm;
+        amrex::ParallelDescriptor::Bcast(
+            counts.data(), counts.size(), info.root_proc, comm);
+        amrex::ParallelDescriptor::Bcast(
+            bounds.data(), bounds.size(), info.root_proc, comm);
+        amrex::ParallelDescriptor::Bcast(&num_procs, 1, info.root_proc, comm);
+        procs.resize(num_procs);
+        amrex::ParallelDescriptor::Bcast(
+            procs.data(), procs.size(), info.root_proc, comm);
+    }
+#endif
+    info.procs = std::set<int>(procs.begin(), procs.end());
+    info.actuator_in_proc =
+        info.procs.contains(amrex::ParallelDescriptor::MyProc());
+    // Keep current bounds on all ranks for the existing regrid callback.
+    const auto& domain = data.sim().mesh().Geom(0).ProbDomain();
+    vs::Vector lo{domain.hi(0), domain.hi(1), domain.hi(2)};
+    vs::Vector hi{domain.lo(0), domain.lo(1), domain.lo(2)};
+    for (int g = 0; g < static_cast<int>(grids.size()); ++g) {
+        const auto offset = 6 * static_cast<size_t>(g);
+        const amrex::RealBox box(
+            bounds.data() + offset, bounds.data() + offset + 3);
+        if (g > 0) {
+            meta.rotors[g - 1]->data.info().bound_box = box;
+        }
+        if (counts[g] == 0) {
+            continue;
+        }
+        for (int d = 0; d < 3; ++d) {
+            lo[d] = std::min(lo[d], box.lo(d));
+            hi[d] = std::max(hi[d], box.hi(d));
+        }
+    }
+    info.bound_box = amrex::RealBox(lo.data(), hi.data());
+    if (!info.actuator_in_proc) {
+        return;
+    }
+    auto& buffer = meta.projection_buffer;
+    amrex::Long total = 0;
+    for (const int n : counts) {
+        total += n;
+    }
+    AMREX_ALWAYS_ASSERT(total <= std::numeric_limits<int>::max() / 18);
+    buffer.resize(18 * total);
+    const auto transfer = [&]() {
+        size_t offset = 0;
+        const auto value = [&](amrex::Real& v) {
+            if (info.is_root_proc) {
+                buffer[offset] = v;
+            } else {
+                v = buffer[offset];
+            }
+            ++offset;
+        };
+        for (int g = 0; g < static_cast<int>(grids.size()); ++g) {
+            auto& grid = *grids[g];
+            grid.pos.resize(counts[g]);
+            grid.force.resize(counts[g]);
+            grid.epsilon.resize(counts[g]);
+            grid.orientation.resize(counts[g]);
+            for (int i = 0; i < counts[g]; ++i) {
+                for (auto* vector :
+                     {&grid.pos[i], &grid.force[i], &grid.epsilon[i]}) {
+                    for (auto& v : *vector) {
+                        value(v);
+                    }
+                }
+                for (auto& v : grid.orientation[i]) {
+                    value(v);
+                }
+            }
+        }
+    };
+    if (info.is_root_proc) {
+        transfer();
+    }
+#ifdef AMREX_USE_MPI
+    constexpr int projection_tag = 1002;
+    if (amrex::ParallelDescriptor::NProcs() > 1) {
+        if (info.is_root_proc) {
+            for (const int rank : procs) {
+                if (rank != info.root_proc) {
+                    amrex::ParallelDescriptor::Send(
+                        buffer.data(), buffer.size(), rank, projection_tag,
+                        *meta.sampling_comm);
+                }
+            }
+        } else {
+            amrex::ParallelDescriptor::Recv(
+                buffer.data(), buffer.size(), info.root_proc, projection_tag,
+                *meta.sampling_comm);
+        }
+    }
+#endif
+    if (!info.is_root_proc) {
+        transfer();
+    }
+}
+
 void input_error(const std::string& label, const std::string& message)
 {
     amrex::Abort("Drone '" + label + "': " + message);
@@ -294,6 +566,7 @@ void ReadInputsOp<Drone, ActSrcDrone>::operator()(
     Drone::DataType& data, const utils::ActParser& pp)
 {
     auto& meta = data.meta();
+    data.info().force_update_all_ranks = true;
     const auto& label = data.info().label;
 
     pp.get("num_rotors", meta.num_rotors);
@@ -439,9 +712,48 @@ void ReadInputsOp<Drone, ActSrcDrone>::operator()(
         data.info().bound_box = data.sim().mesh().Geom(0).ProbDomain();
 }
 
+template <>
+void determine_root_proc<Drone>(
+    Drone::DataType& data, amrex::Vector<int>& act_proc_count)
+{
+    auto& info = data.info();
+    info.procs =
+        utils::determine_influenced_procs(data.sim().mesh(), info.bound_box);
+    utils::determine_root_proc(info, act_proc_count);
+    select_sampling_owner(data);
+}
+
+template <>
+void determine_influenced_procs<Drone>(Drone::DataType& data)
+{
+    auto& info = data.info();
+    info.procs =
+        utils::determine_influenced_procs(data.sim().mesh(), info.bound_box);
+    if (info.root_proc >= 0) {
+        info.procs.insert(info.root_proc);
+    }
+    select_sampling_owner(data);
+}
+
 void InitDataOp<Drone, ActSrcDrone>::operator()(Drone::DataType& data)
 {
     auto& meta = data.meta();
+#ifdef AMREX_USE_MPI
+    if (data.info().root_proc >= 0 && amrex::ParallelDescriptor::NProcs() > 1 &&
+        !meta.sampling_comm) {
+        meta.sampling_comm = std::shared_ptr<MPI_Comm>(
+            new MPI_Comm(MPI_COMM_NULL), [](MPI_Comm* comm) {
+                int finalized = 0;
+                MPI_Finalized(&finalized);
+                if (!finalized && *comm != MPI_COMM_NULL) {
+                    MPI_Comm_free(comm);
+                }
+                delete comm;
+            });
+        amrex::ParallelDescriptor::Comm_dup(
+            amrex::ParallelDescriptor::Communicator(), *meta.sampling_comm);
+    }
+#endif
     int total_points = 0;
     for (auto& rotor : meta.rotors) {
         InitDataOp<ActuatorSector, ActSrcSector>()(rotor->data);
@@ -498,6 +810,11 @@ void UpdateVelOp<Drone, ActSrcDrone>::operator()(Drone::DataType& data)
 
 void ComputeForceOp<Drone, ActSrcDrone>::operator()(Drone::DataType& data)
 {
+    share_sampled_fields(data);
+    if (data.info().root_proc >= 0 && !data.info().is_root_proc) {
+        distribute_projection(data);
+        return;
+    }
     auto& meta = data.meta();
     const auto& time = data.sim().time();
     const amrex::Real midpoint_time =
@@ -550,6 +867,7 @@ void ComputeForceOp<Drone, ActSrcDrone>::operator()(Drone::DataType& data)
         meta.total_moment =
             meta.total_moment - ((grid.pos[i] - drone_center) ^ grid.force[i]);
     }
+    distribute_projection(data);
 }
 
 void ProcessOutputsOp<Drone, ActSrcDrone>::prepare_outputs(
@@ -582,59 +900,11 @@ void ActSrcOp<Drone, ActSrcDrone>::initialize()
     }
 }
 
-void ActSrcOp<Drone, ActSrcDrone>::update_structure_bounds()
-{
-    // Retain the full-domain path if a kernel is unbounded or its frame is
-    // not a rotation. In particular, do not truncate 2D arm projections.
-    m_structure_bounds = m_data.sim().mesh().Geom(0).ProbDomain();
-    if (m_points.empty()) {
-        return;
-    }
-
-    const auto max_coordinate = std::numeric_limits<amrex::Real>::max();
-    vs::Vector lower{max_coordinate, max_coordinate, max_coordinate};
-    vs::Vector upper{-max_coordinate, -max_coordinate, -max_coordinate};
-    const auto rotation_tolerance =
-        64.0_rt * std::numeric_limits<amrex::Real>::epsilon();
-    for (const auto& point : m_points) {
-        const auto& orientation = point.orientation;
-        const std::array rows{
-            orientation.x(), orientation.y(), orientation.z()};
-        for (int j = 0; j < 3; ++j) {
-            if (!std::isfinite(point.dcoord_flags[j]) ||
-                point.dcoord_flags[j] == 0.0_rt) {
-                return;
-            }
-            for (int k = 0; k < 3; ++k) {
-                const amrex::Real expected = (j == k) ? 1.0_rt : 0.0_rt;
-                if (!(std::abs((rows[j] & rows[k]) - expected) <
-                      rotation_tolerance)) {
-                    return;
-                }
-            }
-        }
-        // The kernel maps world distances to local axes with orientation.
-        // Its existing cutoff is sum((local_distance * flags / epsilon)^2)
-        // < 16. For a rotation, each world-axis extent is four times the
-        // norm of the corresponding column scaled by epsilon/abs(flags).
-        for (int d = 0; d < 3; ++d) {
-            amrex::Real extent_squared = 0.0_rt;
-            for (int j = 0; j < 3; ++j) {
-                const auto component = orientation[(3 * j) + d] *
-                                       point.epsilon[j] /
-                                       std::abs(point.dcoord_flags[j]);
-                extent_squared += component * component;
-            }
-            const auto extent = 4.0_rt * std::sqrt(extent_squared);
-            lower[d] = std::min(lower[d], point.pos[d] - extent);
-            upper[d] = std::max(upper[d], point.pos[d] + extent);
-        }
-    }
-    m_structure_bounds = amrex::RealBox(lower.data(), upper.data());
-}
-
 void ActSrcOp<Drone, ActSrcDrone>::setup_op()
 {
+    if (m_data.info().root_proc >= 0 && !m_data.info().actuator_in_proc) {
+        return;
+    }
     const auto& grid = m_data.grid();
     for (int i = 0; i < static_cast<int>(m_points.size()); ++i) {
         auto& point = m_points[i];
@@ -643,7 +913,7 @@ void ActSrcOp<Drone, ActSrcDrone>::setup_op()
         point.epsilon = grid.epsilon[i];
         point.orientation = grid.orientation[i];
     }
-    update_structure_bounds();
+    m_structure_bounds = structure_bounds(m_data);
     amrex::Gpu::copy(
         amrex::Gpu::hostToDevice, m_points.begin(), m_points.end(),
         m_device_points.begin());

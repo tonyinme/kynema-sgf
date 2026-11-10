@@ -728,11 +728,23 @@ Locations are in the drone frame; existing drone motion and rotor layout
 apply to the structure. Forces and moments in the drone output include the
 structure and remain density-normalized, as for the rotors.
 
-Structural projection skips cells outside the existing Gaussian support
-(:math:`4\epsilon` along each local kernel axis). The support bounds account
-for point positions, orientations and widths and update with drone motion.
+Structural projection skips cells outside conservative bounds of the existing
+Gaussian support (:math:`4\epsilon` along each local kernel axis). The bounds
+use the largest applied width and update with drone motion.
 This changes only the amount of projection work, not the applied forces or
 input settings. Unbounded 2D arm kernels retain full-domain evaluation.
+
+Drone velocity/density sampling uses one owner rank, normally the drone's
+root rank. If that rank has no mesh cells, a mesh-owning rank is selected.
+Particles are distributed to the cells containing the sample locations by
+the existing sampling container. Samples are delivered to the fixed root,
+which alone advances aerodynamics and FLLC histories. Current projection data
+are sent only to mesh ranks intersecting its conservative bounding region,
+plus the root and sampling owner. A small participation header is shared with
+all ranks so a moving drone can enter previously inactive ranks without
+migrating FLLC state.
+Physical sampling-point counts do not grow with MPI rank count. This applies
+automatically to rotor-only and structure-enabled drones, including regridding.
 
 Required body inputs (under ``Actuator.Drone`` or ``Actuator.<name>``):
 
@@ -797,8 +809,8 @@ the wing calculation is performed in a stationary local section frame.
 Structural forces use the same Gaussian function as the actuator-line model.
 Resolve the specified widths on the CFD grid and keep kernel support within
 the domain when checking integrated loads. Structural sampling and deposition
-use the drone timestep midpoint. The structural search region conservatively
-covers the domain so moving supports cannot be omitted by process selection.
+use the drone timestep midpoint. Process selection is updated from current
+structural points and all swept rotor force points each force update.
 
 For example, add the following to an existing drone input::
 

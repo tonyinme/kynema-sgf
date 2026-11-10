@@ -210,6 +210,10 @@ struct ActInfo
     //! actuator point
     bool sample_vel_in_proc{false};
 
+    //! Force coordination must also reach ranks newly entered by moving
+    //! sources.
+    bool force_update_all_ranks{false};
+
     ActInfo(std::string label_in, const int id_in)
         : label(std::move(label_in)), id(id_in)
     {}
